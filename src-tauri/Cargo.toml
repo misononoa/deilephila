@@ -49,6 +49,7 @@ libp2p = { version = "0.55", features = [
     "mdns",
     "request-response",
     "gossipsub",
+    "kad",
     "macros",
 ] }
 futures = "0.3"
