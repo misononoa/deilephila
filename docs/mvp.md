@@ -34,7 +34,7 @@
 | M4a | 最小署名付き head 通知 `HeadAnnounce`(`pubkey/seq/head_cid/signature` — IPNS-headレコードの前方互換サブセット。`seq` は head イベントの `seq` を流用し M5 の IPNS `sequence` へ引き継ぐ)の署名/検証 + `follows` テーブル + timeline クエリ(自分+フォロー対象の時系列マージ)。ネット非依存の純粋ロジック + SQLite。フォローは MVP ではローカルのみで `Follow` イベントは載せない([data-model.md](data-model.md) §5) | 単体テストで announce の署名検証・改ざん検出・シリアライズ決定性、follows CRUD、timeline が購読集合の投稿のみを返すこと |
 | M4b | gossipsub を Swarm に統合(topic `deilephila/feed/<pubkey>`) + チェーン同期エンジン(`HeadReceived` → 署名・seq 検証 → head から `prev` 遡行で未取得ブロック回収 → projection 更新)。同期エンジンは Swarm ループ外の core 側タスクに置く(`GetBlock` が mpsc で Swarm ループと往復するため) | 2ノード in-process 統合テストで、購読後の publish により過去分も含むチェーン取得、不正署名 announce の無視、stale(既知 seq 以下)の no-op |
 | M4c | フォロー系 Tauri コマンド + `create_post` 後と unlock 時の head publish(後者は M5 定期 republish の先取り) + `NetworkEvent` 消費タスク(同期完了でフロントへ `timeline-updated` を emit) + フォロー管理 UI・タイムライン表示・リアルタイム更新 | 手動 2 インスタンス検証(データディレクトリを環境変数で分離): フォロー相手の新規投稿がリアルタイム表示(LAN/ローカル) |
-| M5 | IPNS-headレコードの自前生成/検証(protobuf+署名+seq+EOL + プロフィールスナップショット `display_name`/`profile_cid`) + DHT publish/resolve。M4の最小通知をIPNS-headレコードへ格上げ。複数ローカルノードで検証 | 後発フォロワー/一時オフライン後に DHT-IPNS で最新 head と表示名を取得 |
+| M5 | IPNS-headレコードの自前生成/検証(DAG-CBOR+署名+seq+EOL + プロフィールスナップショット `display_name`/`profile_cid`) + DHT publish/resolve。M4の最小通知をIPNS-headレコードへ格上げ。複数ローカルノードで検証 | 後発フォロワー/一時オフライン後に DHT-IPNS で最新 head と表示名を取得 |
 | M6 | フォローグラフ探索(`GetLatestHead` request-response) + EOL失効後の最良レコード探索 + 未取得ブロック回収 | 発信者オフライン＋EOL失効後に、別フォロワー経由で最新 head とブロックを取得 |
 | M7 | NAT越え/ブートストラップ(autonat/dcutr/relay, QUIC) | 別ネットワークのピア間でフォロー・閲覧が成立 |
 | M8 | 安定化(peer scoring、複製・保持ポリシー=上限/LRU/自チェーンpin/設定UI、エラーUI、`Edit`/`Delete` の fold 反映) | 実利用に耐える基本品質 |
@@ -46,6 +46,7 @@
 チェーンの最新イベントを指す可変ポインタは IPNS-headレコードに一本化した(IPNS名 = アカウント公開鍵)。当初は「自前の mutable record を設計するか、IPNS を採用するか」が要決定事項だったが、IPNS の採用で決着している。
 
 - 搬送経路: 署名付き IPNS-headレコードを gossipsub と DHT の両方で配信する。gossipsub はオンラインのフォロワーへの即時通知を、DHT はオフラインだったピアが後から取得するための永続配信を担う。どちらの経路でも取得できない場合や、取得できたレコードの鮮度が疑わしい場合は、フォローグラフ内のピアに `GetLatestHead` で問い合わせて、より良いレコードを探索する。
+- ワイヤ形式: レコードはイベントチェーンと同じ canonical DAG-CBOR でシリアライズする。IPNS 仕様の protobuf 形式(`IpnsEntry`)は、公開 IPFS との相互運用を必要としない([networking.md](networking.md) §3.1)一方で V1/V2 二重署名や protobuf 依存の追加など実装コストが大きいため採用しない。
 - 解決規則: 複数の候補レコードが集まったとき、「署名検証に成功し、かつ `sequence` が最大のもの」を採用する(argmax統一規則)。経路ごとに優先順位を付ける階層的フォールバックではなくこの単一規則に統一することで、古い(stale な)レコードに解決結果が引きずられることを防ぐ。
 - 安全性: チェーンは追記専用かつ全イベントが署名付きなので、第三者が本人になりすまして偽の新イベントを作ること(forward-forge)はできない。攻撃者にできるのは、古いレコードだけを提示して最新の更新を隠すこと(出し惜しみ)までであり、それも argmax統一規則により、より新しいレコードが1つでも届いた時点で無効化される。
 - 原理的な限界: アカウントが新規で誰にも複製されておらず、オンラインのフォロワーが1人もおらず、かつ IPNS-headレコードが EOL を過ぎて DHT から失効している、という3条件が重なると、そのアカウントの head は発見できない。これはサーバーを持たない純粋な P2P 構成の原理的な床であり、受容する。
