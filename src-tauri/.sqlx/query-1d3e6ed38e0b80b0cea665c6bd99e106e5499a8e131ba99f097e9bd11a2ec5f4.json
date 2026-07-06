@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE posts SET text = ?, edited = 1, latest_edit_seq = ?\n                     WHERE cid = ? AND latest_edit_seq < ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "1d3e6ed38e0b80b0cea665c6bd99e106e5499a8e131ba99f097e9bd11a2ec5f4"
+}

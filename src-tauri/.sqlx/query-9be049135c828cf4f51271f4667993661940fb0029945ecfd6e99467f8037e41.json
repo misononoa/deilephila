@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO accounts (pubkey, display_name, bio, latest_head_cid, last_seen)\n                     VALUES (?, ?, ?, NULL, ?)\n                     ON CONFLICT(pubkey) DO UPDATE SET\n                         display_name = excluded.display_name,\n                         bio          = excluded.bio,\n                         last_seen    = excluded.last_seen",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "9be049135c828cf4f51271f4667993661940fb0029945ecfd6e99467f8037e41"
+}

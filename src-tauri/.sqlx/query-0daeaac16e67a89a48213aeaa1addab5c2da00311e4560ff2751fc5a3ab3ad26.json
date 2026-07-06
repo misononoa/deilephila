@@ -1,0 +1,44 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT pubkey, display_name, bio, latest_head_cid, last_seen\n             FROM accounts WHERE pubkey = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "pubkey",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "display_name",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "bio",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "latest_head_cid",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "last_seen",
+        "ordinal": 4,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "0daeaac16e67a89a48213aeaa1addab5c2da00311e4560ff2751fc5a3ab3ad26"
+}

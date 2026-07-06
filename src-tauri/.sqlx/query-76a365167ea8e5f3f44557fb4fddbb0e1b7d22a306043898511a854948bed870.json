@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE posts SET deleted = 1 WHERE cid = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "76a365167ea8e5f3f44557fb4fddbb0e1b7d22a306043898511a854948bed870"
+}

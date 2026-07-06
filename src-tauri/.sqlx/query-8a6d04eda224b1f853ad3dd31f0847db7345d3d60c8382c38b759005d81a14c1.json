@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT cid, author, text, timestamp,\n               edited as \"edited: bool\",\n               deleted as \"deleted: bool\"\n               FROM posts WHERE author = ? ORDER BY seq DESC",
+  "describe": {
+    "columns": [
+      {
+        "name": "cid",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "author",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "text",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "timestamp",
+        "ordinal": 3,
+        "type_info": "Integer"
+      },
+      {
+        "name": "edited: bool",
+        "ordinal": 4,
+        "type_info": "Integer"
+      },
+      {
+        "name": "deleted: bool",
+        "ordinal": 5,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "8a6d04eda224b1f853ad3dd31f0847db7345d3d60c8382c38b759005d81a14c1"
+}

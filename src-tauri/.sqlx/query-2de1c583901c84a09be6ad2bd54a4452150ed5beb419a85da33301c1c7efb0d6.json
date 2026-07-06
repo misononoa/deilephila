@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT f.pubkey, f.since,\n               NULLIF(a.display_name, '') AS \"display_name?: String\"\n               FROM follows f\n               LEFT JOIN accounts a ON a.pubkey = f.pubkey\n               ORDER BY f.since DESC",
+  "describe": {
+    "columns": [
+      {
+        "name": "pubkey",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "since",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "display_name?: String",
+        "ordinal": 2,
+        "type_info": "Null"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "2de1c583901c84a09be6ad2bd54a4452150ed5beb419a85da33301c1c7efb0d6"
+}

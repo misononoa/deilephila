@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM follows WHERE pubkey = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "659ab7b1eac787a1dc4cc0d0e1554a97e5471ee39506c6f09e2832aa9938c18e"
+}

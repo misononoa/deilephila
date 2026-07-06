@@ -1,0 +1,4 @@
+CREATE TABLE IF NOT EXISTS follows (
+    pubkey TEXT    PRIMARY KEY NOT NULL,
+    since  INTEGER NOT NULL
+);

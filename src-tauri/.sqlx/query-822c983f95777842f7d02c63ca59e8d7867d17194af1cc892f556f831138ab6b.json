@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR IGNORE INTO posts\n                     (cid, author, seq, text, timestamp, edited, deleted, latest_edit_seq)\n                     VALUES (?, ?, ?, ?, ?, 0, 0, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "822c983f95777842f7d02c63ca59e8d7867d17194af1cc892f556f831138ab6b"
+}

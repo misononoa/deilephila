@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO follows (pubkey, since) VALUES (?, ?)\n             ON CONFLICT(pubkey) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "ef8bb599a2f4503dc0372e7b562bbb6450404f7bad24604b0329633d08b99831"
+}

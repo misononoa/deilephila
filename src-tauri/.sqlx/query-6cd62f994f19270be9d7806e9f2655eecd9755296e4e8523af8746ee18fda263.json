@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT raw_cbor FROM events WHERE cid = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "raw_cbor",
+        "ordinal": 0,
+        "type_info": "Blob"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6cd62f994f19270be9d7806e9f2655eecd9755296e4e8523af8746ee18fda263"
+}
