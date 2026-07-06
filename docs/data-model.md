@@ -156,6 +156,7 @@ projection は純粋な関数(`events` の fold)なので、DBが壊れても `e
 | `events` | 検証済み生イベント(チェーンそのもの。検証は挿入前に実施) | cid, author, seq, prev_cid, timestamp, kind_tag, kind_json, raw_cbor(DAG-CBOR 原文 — ブロック提供と再検証の源泉) |
 | `posts` | `Post`+`Edit`+`Delete` を fold した表示用投稿 | cid(=生成イベント), author, seq, text(編集適用後), timestamp, edited, deleted, latest_edit_seq(last-write-wins 判定用) |
 | `accounts` | プロフィール fold 結果 + head 記録 | pubkey, display_name, bio, latest_head_cid, last_seen |
+| `head_records` | 最新 IPNS-headレコードの常時保持(自分 + フォロー相手。[networking.md](networking.md) §3.2) | pubkey, sequence, record_bytes(署名済みレコードの DAG-CBOR 原文), updated_at |
 | `follows` | フォローリスト | pubkey, since |
 | `peers` | ピア情報 | peer_id, multiaddrs, last_connected |
 

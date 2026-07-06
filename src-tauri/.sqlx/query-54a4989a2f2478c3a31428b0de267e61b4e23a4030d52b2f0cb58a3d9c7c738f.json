@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT sequence, record_bytes FROM head_records WHERE pubkey = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "sequence",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "record_bytes",
+        "ordinal": 1,
+        "type_info": "Blob"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "54a4989a2f2478c3a31428b0de267e61b4e23a4030d52b2f0cb58a3d9c7c738f"
+}

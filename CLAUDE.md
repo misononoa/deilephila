@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## プロジェクトの現状
 
-deilephila は **完全分散型(P2P)ソーシャルネットワーク**のデスクトップアプリ。設計は概ね固まり、現在は実装フェーズ。**M0–M4 完了(2インスタンス手動検証済み)、次は M5(IPNS-headレコード自前実装 + DHT publish/resolve)**。進捗の正典は [docs/mvp.md](docs/mvp.md) §3・§5。設計は [docs/](docs/) が正典であり、実装の各ステップで該当ドキュメントを必ず参照すること。
+deilephila は **完全分散型(P2P)ソーシャルネットワーク**のデスクトップアプリ。設計は概ね固まり、現在は実装フェーズ。**M0–M5 実装完了(M5 の複数インスタンス手動検証が残)、次は M6(フォローグラフ探索 `GetLatestHead`)**。進捗の正典は [docs/mvp.md](docs/mvp.md) §3・§5。設計は [docs/](docs/) が正典であり、実装の各ステップで該当ドキュメントを必ず参照すること。
 
 ## 作業の進め方(重要)
 

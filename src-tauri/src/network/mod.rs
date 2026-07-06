@@ -19,8 +19,8 @@ use tracing::{debug, info, warn};
 
 use crate::{
     head::{
-        announce_from_bytes, announce_to_bytes, feed_topic_str, record_from_bytes,
-        record_to_bytes, select_best, verify_ipns_record, HeadAnnounce, IpnsRecord,
+        feed_topic_str, record_from_bytes, record_to_bytes, select_best, verify_ipns_record,
+        IpnsRecord,
     },
     network::protocol::{BlockExchangeCodec, BlockExchangeProtocol, BlockResponse, WantBlock},
     store::{bytes_to_hex, Store},
@@ -36,12 +36,9 @@ pub enum NetworkCommand {
         reply: oneshot::Sender<Option<Vec<u8>>>,
     },
     Dial(Multiaddr),
-    /// 自分の head 通知を feed トピックへ publish する(fire-and-forget)
-    PublishHead(HeadAnnounce),
     /// IPNS-headレコードを gossipsub(即時)と kad DHT(永続)の両経路へ
-    /// publish する(fire-and-forget、networking.md §4.1・§4.2)。
-    /// M5c で `PublishHead` を置き換える正式経路
-    PublishHeadRecord(IpnsRecord),
+    /// publish する(fire-and-forget、networking.md §4.1・§4.2)
+    PublishHead(IpnsRecord),
     /// DHT から IPNS-headレコードの候補を収集する(networking.md §4.2)。
     /// 署名検証と argmax 選択は受け手(`NetworkHandle::resolve_ipns`)で行う
     ResolveIpns {
@@ -60,13 +57,8 @@ pub enum NetworkCommand {
 pub enum NetworkEvent {
     PeerConnected(PeerId),
     PeerDiscovered(PeerId),
-    /// gossipsub で head 通知を受信した(署名検証は同期エンジン側で行う)
-    HeadReceived {
-        announce: HeadAnnounce,
-        source: PeerId,
-    },
     /// gossipsub で IPNS-headレコードを受信した(署名検証は同期エンジン側で行う)
-    HeadRecordReceived {
+    HeadReceived {
         record: IpnsRecord,
         source: PeerId,
     },
@@ -104,17 +96,10 @@ impl NetworkHandle {
         let _ = self.cmd_tx.send(NetworkCommand::Dial(addr)).await;
     }
 
-    pub async fn publish_head(&self, announce: HeadAnnounce) {
+    pub async fn publish_head(&self, record: IpnsRecord) {
         let _ = self
             .cmd_tx
-            .send(NetworkCommand::PublishHead(announce))
-            .await;
-    }
-
-    pub async fn publish_head_record(&self, record: IpnsRecord) {
-        let _ = self
-            .cmd_tx
-            .send(NetworkCommand::PublishHeadRecord(record))
+            .send(NetworkCommand::PublishHead(record))
             .await;
     }
 
@@ -242,17 +227,7 @@ async fn run_swarm_loop(
                     let req_id = swarm.behaviour_mut().exchange.send_request(&peer, req);
                     pending.insert(req_id, (cid, reply));
                 }
-                Some(NetworkCommand::PublishHead(announce)) => {
-                    let topic_str =
-                        feed_topic_str(&bytes_to_hex(announce.payload.pubkey.as_ref()));
-                    let topic = gossipsub::IdentTopic::new(topic_str);
-                    let data = announce_to_bytes(&announce);
-                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, data) {
-                        // 購読者がいない場合の InsufficientPeers 等。fire-and-forget なので警告のみ
-                        warn!("head publish failed: {e}");
-                    }
-                }
-                Some(NetworkCommand::PublishHeadRecord(record)) => {
+                Some(NetworkCommand::PublishHead(record)) => {
                     publish_head_record(&mut swarm, &record);
                 }
                 Some(NetworkCommand::ResolveIpns { pubkey, reply }) => {
@@ -343,31 +318,19 @@ async fn run_swarm_loop(
                         propagation_source,
                         message,
                         ..
-                    } => {
-                        // M5c 移行期: IPNS-headレコード(正式)と HeadAnnounce(M4)の
-                        // 両ペイロードを受理する。フィールド構成が異なるため誤認しない
-                        if let Ok(record) = record_from_bytes(&message.data) {
-                            // 真正性は payload 内の署名で別途検証されるため、ここでは検証しない
-                            let _ = event_tx.try_send(NetworkEvent::HeadRecordReceived {
+                    } => match record_from_bytes(&message.data) {
+                        Ok(record) => {
+                            // source は転送元(直接接続中のピア)。レコードの真正性は
+                            // payload 内の署名で別途検証されるため、ここでは検証しない
+                            let _ = event_tx.try_send(NetworkEvent::HeadReceived {
                                 record,
                                 source: propagation_source,
                             });
-                        } else {
-                            match announce_from_bytes(&message.data) {
-                                Ok(announce) => {
-                                    let _ = event_tx.try_send(NetworkEvent::HeadReceived {
-                                        announce,
-                                        source: propagation_source,
-                                    });
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "undecodable gossipsub message from {propagation_source}: {e}"
-                                    );
-                                }
-                            }
                         }
-                    }
+                        Err(e) => {
+                            warn!("undecodable gossipsub message from {propagation_source}: {e}");
+                        }
+                    },
                     gossipsub::Event::Subscribed { peer_id, topic } => {
                         let _ = event_tx.try_send(NetworkEvent::PeerSubscribed {
                             peer: peer_id,
@@ -845,7 +808,7 @@ mod tests {
         wait_peer_connected_ev(&mut events_b).await;
 
         let id = Identity::generate();
-        handle_a.publish_head_record(make_record(&id, 5)).await;
+        handle_a.publish_head(make_record(&id, 5)).await;
 
         let resolved = resolve_with_retry(&handle_b, id.public_key_bytes())
             .await
@@ -873,14 +836,14 @@ mod tests {
         wait_peer_connected_ev(&mut events_c).await;
 
         let id = Identity::generate();
-        handle_a.publish_head_record(make_record(&id, 5)).await;
+        handle_a.publish_head(make_record(&id, 5)).await;
         let resolved = resolve_with_retry(&handle_b, id.public_key_bytes())
             .await
             .expect("initial record not resolvable");
         assert_eq!(resolved.payload.sequence, 5);
 
         // C が古い(署名は正当な)レコードを DHT に流し込む
-        handle_c.publish_head_record(make_record(&id, 3)).await;
+        handle_c.publish_head(make_record(&id, 3)).await;
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         let resolved = resolve_with_retry(&handle_b, id.public_key_bytes())
@@ -904,7 +867,7 @@ mod tests {
         let id = Identity::generate();
         let mut tampered = make_record(&id, 9);
         tampered.payload.sequence = 10;
-        handle_a.publish_head_record(tampered).await;
+        handle_a.publish_head(tampered).await;
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         assert!(handle_b.resolve_ipns(id.public_key_bytes()).await.is_none());
@@ -926,7 +889,7 @@ mod tests {
         wait_peer_connected_ev(&mut events_c).await;
 
         let id = Identity::generate();
-        handle_a.publish_head_record(make_record(&id, 7)).await;
+        handle_a.publish_head(make_record(&id, 7)).await;
 
         // C の解決: B が複製を返すか、B の紹介で A に到達するかのいずれか
         let resolved = resolve_with_retry(&handle_c, id.public_key_bytes())
@@ -938,7 +901,7 @@ mod tests {
     #[tokio::test]
     async fn record_over_gossipsub() {
         // 両経路化の gossipsub 側: レコードそのものが topic に流れ、
-        // 受信側で HeadRecordReceived として届く
+        // 受信側で HeadReceived として届く
         let store_a = Arc::new(Store::open_in_memory().await.unwrap());
         let (handle_a, mut events_a, addr_a) = spawn_test_node(store_a).await;
         let store_b = Arc::new(Store::open_in_memory().await.unwrap());
@@ -962,12 +925,12 @@ mod tests {
         .await
         .expect("subscription not propagated");
 
-        handle_a.publish_head_record(make_record(&id, 2)).await;
+        handle_a.publish_head(make_record(&id, 2)).await;
 
         let record = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 match events_b.recv().await {
-                    Some(NetworkEvent::HeadRecordReceived { record, .. }) => return record,
+                    Some(NetworkEvent::HeadReceived { record, .. }) => return record,
                     Some(_) => continue,
                     None => panic!("event channel closed"),
                 }
