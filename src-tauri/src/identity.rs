@@ -1,9 +1,8 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use cid::Cid;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 use crate::event::{payload_to_dag_cbor, EventEnvelope, EventKind, EventPayload};
+use crate::util::now_ms;
 
 pub struct Identity {
     signing_key: SigningKey,
@@ -60,17 +59,12 @@ pub fn create_envelope(
     prev: Option<Cid>,
     kind: EventKind,
 ) -> EventEnvelope {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before epoch")
-        .as_millis() as i64;
-
     let payload = EventPayload {
         seq,
         kind,
         prev,
         author: serde_bytes::ByteArray::new(identity.public_key_bytes()),
-        timestamp: now_ms,
+        timestamp: now_ms(),
     };
     let cbor = payload_to_dag_cbor(&payload);
     let sig = identity.sign_bytes(&cbor);

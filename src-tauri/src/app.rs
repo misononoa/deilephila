@@ -18,8 +18,9 @@ use crate::head::{create_ipns_record, record_to_bytes, IpnsRecord, RECORD_LIFETI
 use crate::identity::{create_envelope, Identity};
 use crate::keystore::Keystore;
 use crate::network::{NetworkEvent, NetworkHandle};
-use crate::store::{bytes_to_hex, hex_to_pubkey, Store, TimelineRow};
+use crate::store::{Store, TimelineRow};
 use crate::sync::SyncOutcome;
+use crate::util::{bytes_to_hex, hex_to_pubkey, now_ms};
 
 // --- ヘルパー ---
 
@@ -31,13 +32,6 @@ impl<T, E: ToString> ToCommandResult<T> for Result<T, E> {
     fn cmd(self) -> Result<T, String> {
         self.map_err(|e| e.to_string())
     }
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before epoch")
-        .as_millis() as i64
 }
 
 /// 公開鍵 hex の正規化と検証(64桁の16進、小文字化)。

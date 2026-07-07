@@ -14,7 +14,8 @@ use common::TestApp;
 use deilephila_lib::app::{self, AppState, Notifier, UiEvent};
 use deilephila_lib::head::feed_topic_str;
 use deilephila_lib::network::NetworkHandle;
-use deilephila_lib::store::{hex_to_pubkey, Store};
+use deilephila_lib::store::Store;
+use deilephila_lib::util::hex_to_pubkey;
 use tokio::sync::mpsc;
 
 /// 投稿間で timestamp(ミリ秒)を確実に単調増加させる。

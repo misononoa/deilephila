@@ -23,7 +23,8 @@ use crate::{
         IpnsRecord,
     },
     network::protocol::{BlockExchangeCodec, BlockExchangeProtocol, BlockResponse, WantBlock},
-    store::{bytes_to_hex, Store},
+    store::Store,
+    util::{bytes_to_hex, now_ms},
 };
 
 // --- 公開型 ---
@@ -369,7 +370,7 @@ fn handle_block_response(
         }
         BlockResponse::Found { data } => {
             // CID 検証: 受信データから再計算したCIDが期待値と一致するか
-            let computed = crate::event::bytes_to_cid(&data);
+            let computed = crate::util::bytes_to_cid(&data);
             if computed != expected_cid {
                 warn!("CID mismatch: expected {expected_cid}, got {computed}");
                 let _ = reply.send(None);
@@ -388,18 +389,11 @@ fn head_record_key(pubkey: &[u8; 32]) -> kad::RecordKey {
     kad::RecordKey::new(&format!("/deilephila/head/{}", bytes_to_hex(pubkey)))
 }
 
-fn now_unix_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 /// レコードの validity(EOL、Unix epoch ミリ秒)を kad ローカル store の
 /// 失効時刻へ換算する。EOL を過ぎたレコードは DHT から自然に消え、
 /// 生存させるには発信者の定期 republish が要る(networking.md §4.2)
 fn expires_from_validity(validity_ms: i64) -> Option<Instant> {
-    let ttl_ms = validity_ms.saturating_sub(now_unix_ms()).max(0) as u64;
+    let ttl_ms = validity_ms.saturating_sub(now_ms()).max(0) as u64;
     Some(Instant::now() + Duration::from_millis(ttl_ms))
 }
 
@@ -698,11 +692,11 @@ mod tests {
 
     // --- IPNS-headレコードの DHT 搬送(M5b) ---
 
-    use crate::event::bytes_to_cid;
+    use crate::util::bytes_to_cid;
     use crate::head::create_ipns_record;
 
     fn far_future_ms() -> i64 {
-        now_unix_ms() + 3_600_000
+        now_ms() + 3_600_000
     }
 
     fn make_record(identity: &Identity, sequence: u64) -> IpnsRecord {

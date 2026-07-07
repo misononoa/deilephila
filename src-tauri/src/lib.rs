@@ -7,6 +7,7 @@ pub mod keystore;
 pub mod network;
 pub mod store;
 pub mod sync;
+pub mod util;
 
 use std::path::PathBuf;
 use std::sync::Arc;

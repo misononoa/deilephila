@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::event::VerifyError;
 use crate::identity::{verify_signature, Identity};
+use crate::util::{from_dag_cbor, to_dag_cbor};
 
 /// 署名付き IPNS-headレコード(docs/data-model.md §2.4)。
 /// head CID を指す可変ポインタで、gossipsub(即時)と kad DHT(永続)の
@@ -38,7 +39,7 @@ pub struct IpnsRecord {
 }
 
 pub fn record_payload_to_dag_cbor(payload: &IpnsRecordPayload) -> Vec<u8> {
-    serde_ipld_dagcbor::to_vec(payload).expect("IpnsRecordPayload DAG-CBOR serialization failed")
+    to_dag_cbor(payload)
 }
 
 /// IPNS-headレコードを署名付きで生成する。
@@ -107,11 +108,11 @@ pub fn select_best<'a>(
 // --- IPNS-headレコードのバイト列相互変換(kad::Record / gossipsub 搬送用) ---
 
 pub fn record_to_bytes(record: &IpnsRecord) -> Vec<u8> {
-    serde_ipld_dagcbor::to_vec(record).expect("IpnsRecord DAG-CBOR serialization failed")
+    to_dag_cbor(record)
 }
 
 pub fn record_from_bytes(data: &[u8]) -> Result<IpnsRecord, String> {
-    serde_ipld_dagcbor::from_slice(data).map_err(|e| e.to_string())
+    from_dag_cbor(data)
 }
 
 /// アカウント公開鍵(hex)から gossipsub トピック名を導出する。
@@ -124,7 +125,7 @@ pub fn feed_topic_str(pubkey_hex: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::bytes_to_cid;
+    use crate::util::bytes_to_cid;
 
     #[test]
     fn topic_name_format() {

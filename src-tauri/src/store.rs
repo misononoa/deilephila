@@ -4,6 +4,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
 
 use crate::event::{envelope_cid, EventEnvelope, EventKind};
+use crate::util::{bytes_to_hex, to_dag_cbor};
 
 pub struct Store {
     pool: SqlitePool,
@@ -114,8 +115,7 @@ impl Store {
         let kind_tag = kind_tag_str(&envelope.payload.kind);
         let kind_json = serde_json::to_string(&envelope.payload.kind)
             .map_err(|e| StoreError::Serialization(e.to_string()))?;
-        let raw_cbor: Vec<u8> = serde_ipld_dagcbor::to_vec(envelope)
-            .expect("EventEnvelope DAG-CBOR serialization failed");
+        let raw_cbor: Vec<u8> = to_dag_cbor(envelope);
 
         let mut tx = self.pool.begin().await?;
 
@@ -431,22 +431,6 @@ impl Store {
         .await?;
         Ok(row.map(|r| r.cid))
     }
-}
-
-pub fn bytes_to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-/// 64桁 hex を公開鍵バイト列へ変換する(不正な形式は None)。
-pub fn hex_to_pubkey(hex: &str) -> Option<[u8; 32]> {
-    if hex.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?;
-    }
-    Some(out)
 }
 
 fn kind_tag_str(kind: &EventKind) -> &'static str {

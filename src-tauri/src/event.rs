@@ -1,9 +1,8 @@
 use cid::Cid;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use multihash_codetable::{Code, MultihashDigest};
 use serde::{Deserialize, Serialize};
 
-const DAG_CBOR_CODEC: u64 = 0x71;
+use crate::util::{bytes_to_cid, to_dag_cbor};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventEnvelope {
@@ -52,18 +51,11 @@ pub enum EventKind {
 // --- CID 生成 ---
 
 pub fn payload_to_dag_cbor(payload: &EventPayload) -> Vec<u8> {
-    serde_ipld_dagcbor::to_vec(payload).expect("EventPayload DAG-CBOR serialization failed")
-}
-
-pub fn bytes_to_cid(bytes: &[u8]) -> Cid {
-    let mh = Code::Sha2_256.digest(bytes);
-    Cid::new_v1(DAG_CBOR_CODEC, mh)
+    to_dag_cbor(payload)
 }
 
 pub fn envelope_cid(envelope: &EventEnvelope) -> Cid {
-    let bytes =
-        serde_ipld_dagcbor::to_vec(envelope).expect("EventEnvelope DAG-CBOR serialization failed");
-    bytes_to_cid(&bytes)
+    bytes_to_cid(&to_dag_cbor(envelope))
 }
 
 // --- 署名検証 ---

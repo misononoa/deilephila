@@ -5,14 +5,8 @@ use tracing::debug;
 use crate::event::{verify_envelope, EventEnvelope};
 use crate::head::{record_to_bytes, verify_ipns_record, IpnsRecord};
 use crate::network::NetworkHandle;
-use crate::store::{bytes_to_hex, Store, StoreError};
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
+use crate::store::{Store, StoreError};
+use crate::util::{bytes_to_hex, now_ms};
 
 /// 1回の同期で辿るチェーン長の上限(不正な announce による暴走防止)。
 const MAX_SYNC_DEPTH: usize = 10_000;
@@ -178,7 +172,8 @@ pub async fn handle_head_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{bytes_to_cid, envelope_cid, EventKind};
+    use crate::event::{envelope_cid, EventKind};
+    use crate::util::bytes_to_cid;
     use crate::head::{create_ipns_record, RECORD_LIFETIME_MS};
     use crate::identity::{create_envelope, Identity};
     use crate::network::{spawn_swarm_loop, NetworkEvent};
