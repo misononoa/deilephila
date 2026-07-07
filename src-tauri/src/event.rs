@@ -60,9 +60,11 @@ pub fn envelope_cid(envelope: &EventEnvelope) -> Cid {
 
 // --- 署名検証 ---
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum VerifyError {
+    #[error("invalid author key")]
     InvalidAuthorKey,
+    #[error("invalid signature")]
     InvalidSignature,
 }
 
@@ -78,13 +80,16 @@ pub fn verify_envelope(envelope: &EventEnvelope) -> Result<(), VerifyError> {
 
 // --- チェーン連結検証 ---
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ChainError {
     /// イベントの author がチェーン所有者と一致しない
+    #[error("author does not match chain owner")]
     WrongAuthor,
     /// seq がチェーン内の期待位置と一致しない
+    #[error("wrong seq: expected {expected}, got {got}")]
     WrongSeq { expected: u64, got: u64 },
     /// genesis(seq=0)に prev がある / 非 genesis に prev がない
+    #[error("genesis/prev mismatch")]
     BrokenPrev,
 }
 

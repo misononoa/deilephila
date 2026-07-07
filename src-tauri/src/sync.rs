@@ -11,51 +11,28 @@ use crate::util::{bytes_to_hex, now_ms};
 /// 1回の同期で辿るチェーン長の上限(不正な announce による暴走防止)。
 const MAX_SYNC_DEPTH: usize = 10_000;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SyncError {
+    #[error("invalid signature")]
     InvalidSignature,
+    #[error("decode error: {0}")]
     Decode(String),
     /// チェーン内のイベントの author が announce の pubkey と一致しない
-    AuthorMismatch {
-        cid: Cid,
-    },
+    #[error("author mismatch at {cid}")]
+    AuthorMismatch { cid: Cid },
     /// prev を辿った先の seq が期待値(1ずつ減少)と一致しない
-    SeqMismatch {
-        cid: Cid,
-        expected: u64,
-        got: u64,
-    },
+    #[error("seq mismatch at {cid}: expected {expected}, got {got}")]
+    SeqMismatch { cid: Cid, expected: u64, got: u64 },
     /// genesis(seq=0) に prev がある / 非 genesis に prev がない
-    BrokenChain {
-        cid: Cid,
-    },
+    #[error("broken chain at {cid}")]
+    BrokenChain { cid: Cid },
     /// ネットワークからブロックを取得できなかった
+    #[error("block unavailable: {0}")]
     BlockUnavailable(Cid),
+    #[error("chain exceeds max sync depth")]
     TooDeep,
-    Store(StoreError),
-}
-
-impl std::fmt::Display for SyncError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SyncError::InvalidSignature => write!(f, "invalid signature"),
-            SyncError::Decode(e) => write!(f, "decode error: {e}"),
-            SyncError::AuthorMismatch { cid } => write!(f, "author mismatch at {cid}"),
-            SyncError::SeqMismatch { cid, expected, got } => {
-                write!(f, "seq mismatch at {cid}: expected {expected}, got {got}")
-            }
-            SyncError::BrokenChain { cid } => write!(f, "broken chain at {cid}"),
-            SyncError::BlockUnavailable(cid) => write!(f, "block unavailable: {cid}"),
-            SyncError::TooDeep => write!(f, "chain exceeds max sync depth"),
-            SyncError::Store(e) => write!(f, "store error: {e}"),
-        }
-    }
-}
-
-impl From<StoreError> for SyncError {
-    fn from(e: StoreError) -> Self {
-        SyncError::Store(e)
-    }
+    #[error("store error: {0}")]
+    Store(#[from] StoreError),
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]

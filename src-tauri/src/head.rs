@@ -111,8 +111,14 @@ pub fn record_to_bytes(record: &IpnsRecord) -> Vec<u8> {
     to_dag_cbor(record)
 }
 
-pub fn record_from_bytes(data: &[u8]) -> Result<IpnsRecord, String> {
-    from_dag_cbor(data)
+#[derive(Debug, thiserror::Error)]
+pub enum HeadError {
+    #[error("failed to decode IPNS head record: {0}")]
+    Decode(String),
+}
+
+pub fn record_from_bytes(data: &[u8]) -> Result<IpnsRecord, HeadError> {
+    from_dag_cbor(data).map_err(HeadError::Decode)
 }
 
 /// アカウント公開鍵(hex)から gossipsub トピック名を導出する。

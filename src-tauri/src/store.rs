@@ -50,33 +50,14 @@ pub struct AccountRow {
     pub last_seen: i64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    Sqlx(sqlx::Error),
-    Migrate(sqlx::migrate::MigrateError),
+    #[error("SQLite error: {0}")]
+    Sqlx(#[from] sqlx::Error),
+    #[error("migration error: {0}")]
+    Migrate(#[from] sqlx::migrate::MigrateError),
+    #[error("serialization error: {0}")]
     Serialization(String),
-}
-
-impl std::fmt::Display for StoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StoreError::Sqlx(e) => write!(f, "SQLite error: {e}"),
-            StoreError::Migrate(e) => write!(f, "migration error: {e}"),
-            StoreError::Serialization(s) => write!(f, "serialization error: {s}"),
-        }
-    }
-}
-
-impl From<sqlx::Error> for StoreError {
-    fn from(e: sqlx::Error) -> Self {
-        StoreError::Sqlx(e)
-    }
-}
-
-impl From<sqlx::migrate::MigrateError> for StoreError {
-    fn from(e: sqlx::migrate::MigrateError) -> Self {
-        StoreError::Migrate(e)
-    }
 }
 
 impl Store {
