@@ -99,6 +99,45 @@ async fn store_and_publish_head_record(
     Ok(())
 }
 
+/// フォロー相手の最新レコードを DHT から解決し、チェーンを取り込むバックグラウンド
+/// タスクを起動する(networking.md §4.2)。新規フォロー時と unlock 時(オフライン中の
+/// 取りこぼし回収。gossipsub は過去分を再送しない)の両方から呼ばれる。
+/// 起動直後はピア接続とルーティングテーブルが形成途中で解決に失敗しうるため、
+/// しばらくリトライする。新規イベントを取り込んだら timeline-updated を emit する。
+fn spawn_resolve_and_sync(
+    app: tauri::AppHandle,
+    store: Arc<Store>,
+    network: NetworkHandle,
+    pubkey_hex: String,
+) {
+    let Some(pubkey_bytes) = hex_to_pubkey(&pubkey_hex) else {
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+        let mut resolved = None;
+        for _ in 0..10 {
+            if let Some(record) = network.resolve_ipns(pubkey_bytes).await {
+                resolved = Some(record);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+        let Some(record) = resolved else {
+            tracing::debug!("no head record in DHT for {pubkey_hex}");
+            return;
+        };
+        match crate::sync::handle_head_record(&store, &network, &record, None).await {
+            Ok(outcome) if outcome.new_events > 0 => {
+                if let Err(e) = app.emit("timeline-updated", ()) {
+                    tracing::warn!("emit timeline-updated failed: {e}");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("dht sync failed for {pubkey_hex}: {e}"),
+        }
+    });
+}
+
 /// 自分の最新 head のレコードを validity を更新して再発行する。
 /// unlock 時と定期 republish タスク(`REPUBLISH_INTERVAL` 周期、lib.rs)から呼ばれる。
 /// 未アンロック・head 未作成なら何もしない。戻り値は publish したかどうか。
@@ -245,6 +284,7 @@ pub async fn setup_account(
 #[tauri::command]
 pub async fn unlock_account(
     passphrase: String,
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
     let ks = Keystore::load(&passphrase, &state.app_dir).cmd()?;
@@ -269,9 +309,16 @@ pub async fn unlock_account(
         head_cid,
     });
 
-    // フォロー全件の feed トピック購読を復元する
+    // フォロー全件の feed トピック購読を復元し、オフライン中の取りこぼしを
+    // DHT から回収する(gossipsub は過去分を再送しないため resolve が唯一の回収経路)
     for follow in state.store.get_follows().await.cmd()? {
-        state.network.subscribe(follow.pubkey).await;
+        state.network.subscribe(follow.pubkey.clone()).await;
+        spawn_resolve_and_sync(
+            app.clone(),
+            Arc::clone(&state.store),
+            state.network.clone(),
+            follow.pubkey,
+        );
     }
     // 再起動時の republish: validity を今から48時間に更新したレコードを再発行する
     // (head 未作成なら no-op)
@@ -335,7 +382,6 @@ pub async fn follow_user(
     if pubkey_hex == self_hex {
         return Err("cannot follow yourself".to_string());
     }
-    let pubkey_bytes = hex_to_pubkey(&pubkey_hex).ok_or("invalid public key")?;
 
     state.store.add_follow(&pubkey_hex, now_ms()).await.cmd()?;
     state.network.subscribe(pubkey_hex.clone()).await;
@@ -343,23 +389,12 @@ pub async fn follow_user(
     // 後発フォロワーの初回同期(networking.md §4.2): gossipsub の次の publish を
     // 待たず、DHT の永続レコードから過去分を取り込む。DHT クエリは数秒かかり
     // うるため、コマンドは即座に返しバックグラウンドで実行する
-    let store = Arc::clone(&state.store);
-    let network = state.network.clone();
-    tauri::async_runtime::spawn(async move {
-        let Some(record) = network.resolve_ipns(pubkey_bytes).await else {
-            tracing::debug!("no head record in DHT for {pubkey_hex}");
-            return;
-        };
-        match crate::sync::handle_head_record(&store, &network, &record, None).await {
-            Ok(outcome) if outcome.new_events > 0 => {
-                if let Err(e) = app.emit("timeline-updated", ()) {
-                    tracing::warn!("emit timeline-updated failed: {e}");
-                }
-            }
-            Ok(_) => {}
-            Err(e) => tracing::warn!("follow-time sync failed: {e}"),
-        }
-    });
+    spawn_resolve_and_sync(
+        app,
+        Arc::clone(&state.store),
+        state.network.clone(),
+        pubkey_hex,
+    );
     Ok(())
 }
 
