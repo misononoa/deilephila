@@ -3,14 +3,13 @@ use std::path::Path;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
 
-use cid::Cid;
-
 use crate::event::{envelope_cid, EventEnvelope, EventKind};
 
 pub struct Store {
     pool: SqlitePool,
 }
 
+/// 単一 author の投稿行。テストが projection の検証に使う。
 #[derive(Debug, Clone)]
 pub struct PostRow {
     pub cid: String,
@@ -29,7 +28,7 @@ pub struct FollowRow {
     pub display_name: Option<String>,
 }
 
-/// タイムライン表示用の行。PostRow + author の display_name。
+/// タイムライン表示用の行。posts の行 + author の display_name。
 #[derive(Debug, Clone)]
 pub struct TimelineRow {
     pub cid: String,
@@ -261,20 +260,6 @@ impl Store {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(|r| r.raw_cbor))
-    }
-
-    /// 受信した生 DAG-CBOR bytes を検証して保存する(ブロック受信用)。
-    /// 検証: デシリアライズ → 署名 → CID 再計算。成功時は CID を返す。
-    pub async fn insert_raw_block(&self, data: &[u8]) -> Result<Cid, StoreError> {
-        let envelope: EventEnvelope = serde_ipld_dagcbor::from_slice(data)
-            .map_err(|e| StoreError::Serialization(e.to_string()))?;
-
-        crate::event::verify_envelope(&envelope)
-            .map_err(|e| StoreError::Serialization(format!("signature invalid: {e:?}")))?;
-
-        let cid = crate::event::envelope_cid(&envelope);
-        self.insert_event(&envelope).await?;
-        Ok(cid)
     }
 
     /// フォローを追加する。既存なら何もしない(冪等。元の since を保持)。

@@ -264,7 +264,6 @@ async fn command_error_paths() {
     assert!(!status.setup && !status.unlocked);
     assert!(app::create_post(&state, "x".into()).await.is_err());
     assert!(app::get_timeline(&state).await.is_err());
-    assert!(app::get_my_posts(&state).await.is_err());
     assert!(app::follow_user(&state, "ab".repeat(32)).await.is_err());
     assert!(app::unlock_account(&state, "pass".into()).await.is_err());
 
