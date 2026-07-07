@@ -1,3 +1,4 @@
+pub mod app;
 pub mod chain;
 pub mod commands;
 pub mod event;
@@ -11,8 +12,8 @@ pub mod sync;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use commands::AppState;
-use network::{spawn_swarm_loop, NetworkEvent, NetworkHandle};
+use app::{AppState, Notifier, UiEvent};
+use network::{spawn_swarm_loop, NetworkHandle};
 use store::Store;
 use tauri::{Emitter, Manager};
 
@@ -74,44 +75,40 @@ pub fn run() {
                 }
             }
 
-            // core タスク: NetworkEvent を消費し、IPNS-headレコードが届いたら
-            // チェーン同期を実行。新規イベントを取り込んだらフロントへ
-            // timeline-updated を通知する。
-            if let Some(mut event_rx) = event_rx {
-                let store = Arc::clone(&store);
-                let network = network_handle.clone();
-                let app_handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    while let Some(event) = event_rx.recv().await {
-                        let NetworkEvent::HeadReceived { record, source } = event else {
-                            continue;
-                        };
-                        match sync::handle_head_record(&store, &network, &record, Some(source))
-                            .await
-                        {
-                            Ok(outcome) if outcome.new_events > 0 => {
-                                if let Err(e) = app_handle.emit("timeline-updated", ()) {
-                                    tracing::warn!("emit timeline-updated failed: {e}");
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(e) => tracing::warn!("chain sync failed: {e}"),
+            // Application Core の配線: NetworkEvent 消費ループ(チェーン同期)と、
+            // Core からの UiEvent をフロントの Tauri イベントへ変換するブリッジ
+            let (notifier, mut ui_rx) = Notifier::channel();
+            if let Some(event_rx) = event_rx {
+                tauri::async_runtime::spawn(app::network_consumer_loop(
+                    Arc::clone(&store),
+                    network_handle.clone(),
+                    event_rx,
+                    notifier.clone(),
+                ));
+            }
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                while let Some(event) = ui_rx.recv().await {
+                    // 接続・購読イベントは現状 UI 未使用(app.rs の UiEvent 参照)
+                    if let UiEvent::TimelineUpdated = event {
+                        if let Err(e) = app_handle.emit("timeline-updated", ()) {
+                            tracing::warn!("emit timeline-updated failed: {e}");
                         }
                     }
-                });
-            }
+                }
+            });
 
-            app.manage(AppState::new(store, app_dir, network_handle));
+            app.manage(AppState::new(store, app_dir, network_handle, notifier));
 
             // 定期 republish タスク: EOL(48時間)の失効前に validity を更新した
             // レコードを再発行し、DHT 上のポインタを生存させる(networking.md §4.2)。
-            // unlock 時の発行と対になる(commands::republish_head)
+            // unlock 時の発行と対になる(app::republish_head)
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 loop {
-                    tokio::time::sleep(commands::REPUBLISH_INTERVAL).await;
+                    tokio::time::sleep(app::REPUBLISH_INTERVAL).await;
                     let state = app_handle.state::<AppState>();
-                    match commands::republish_head(state.inner()).await {
+                    match app::republish_head(state.inner()).await {
                         Ok(true) => tracing::info!("head record republished"),
                         Ok(false) => {}
                         Err(e) => tracing::warn!("head republish failed: {e}"),
