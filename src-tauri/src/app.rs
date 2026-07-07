@@ -290,7 +290,7 @@ pub async fn network_consumer_loop(
 // --- フォロー対象の同期 ---
 
 /// フォロー対象の最新チェーンを DHT から取り込む(networking.md §4.2)。
-/// `follow_user` のバックグラウンド同期と統合テストの共通入口で、M6 の
+/// `spawn_sync_follow_target` と統合テストの共通入口で、M6 の
 /// フォローグラフ探索(`GetLatestHead`)もここに合流する予定。
 /// Ok(None) = DHT にレコードが見つからない(以後 gossipsub / republish で追いつく)。
 pub async fn sync_follow_target(
@@ -305,6 +305,43 @@ pub async fn sync_follow_target(
         .await
         .map(Some)
         .cmd()
+}
+
+/// フォロー相手の最新レコードを DHT から解決し、チェーンを取り込むバックグラウンド
+/// タスクを起動する。新規フォロー時と unlock 時(オフライン中の取りこぼし回収。
+/// gossipsub は過去分を再送しない)の両方から呼ばれる。
+/// 起動直後はピア接続とルーティングテーブルが形成途中で解決に失敗しうるため、
+/// 3秒間隔で最大10回リトライする。新規イベントを取り込んだら `TimelineUpdated` を通知する。
+fn spawn_sync_follow_target(
+    store: Arc<Store>,
+    network: NetworkHandle,
+    notify: Notifier,
+    pubkey_hex: String,
+) {
+    let Some(pubkey_bytes) = hex_to_pubkey(&pubkey_hex) else {
+        return;
+    };
+    tokio::spawn(async move {
+        for attempt in 0..10 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+            match sync_follow_target(&store, &network, pubkey_bytes).await {
+                Ok(Some(outcome)) => {
+                    if outcome.new_events > 0 {
+                        notify.notify(UiEvent::TimelineUpdated);
+                    }
+                    return;
+                }
+                Ok(None) => {} // レコード未発見: リトライ
+                Err(e) => {
+                    tracing::warn!("dht sync failed for {pubkey_hex}: {e}");
+                    return;
+                }
+            }
+        }
+        tracing::debug!("no head record in DHT for {pubkey_hex}");
+    });
 }
 
 // --- コマンド本体 ---
@@ -358,9 +395,16 @@ pub async fn unlock_account(state: &AppState, passphrase: String) -> Result<Stri
         head_cid,
     });
 
-    // フォロー全件の feed トピック購読を復元する
+    // フォロー全件の feed トピック購読を復元し、オフライン中の取りこぼしを
+    // DHT から回収する(gossipsub は過去分を再送しないため resolve が唯一の回収経路)
     for follow in state.store.get_follows().await.cmd()? {
-        state.network.subscribe(follow.pubkey).await;
+        state.network.subscribe(follow.pubkey.clone()).await;
+        spawn_sync_follow_target(
+            Arc::clone(&state.store),
+            state.network.clone(),
+            state.notify.clone(),
+            follow.pubkey,
+        );
     }
     // 再起動時の republish: validity を今から48時間に更新したレコードを再発行する
     // (head 未作成なら no-op)
@@ -415,7 +459,6 @@ pub async fn follow_user(state: &AppState, pubkey: String) -> Result<(), String>
     if pubkey_hex == self_hex {
         return Err("cannot follow yourself".to_string());
     }
-    let pubkey_bytes = hex_to_pubkey(&pubkey_hex).ok_or("invalid public key")?;
 
     state.store.add_follow(&pubkey_hex, now_ms()).await.cmd()?;
     state.network.subscribe(pubkey_hex.clone()).await;
@@ -423,19 +466,12 @@ pub async fn follow_user(state: &AppState, pubkey: String) -> Result<(), String>
     // 後発フォロワーの初回同期(networking.md §4.2): gossipsub の次の publish を
     // 待たず、DHT の永続レコードから過去分を取り込む。DHT クエリは数秒かかり
     // うるため、コマンドは即座に返しバックグラウンドで実行する
-    let store = Arc::clone(&state.store);
-    let network = state.network.clone();
-    let notify = state.notify.clone();
-    tokio::spawn(async move {
-        match sync_follow_target(&store, &network, pubkey_bytes).await {
-            Ok(Some(outcome)) if outcome.new_events > 0 => {
-                notify.notify(UiEvent::TimelineUpdated);
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => tracing::debug!("no head record in DHT for {pubkey_hex}"),
-            Err(e) => tracing::warn!("follow-time sync failed: {e}"),
-        }
-    });
+    spawn_sync_follow_target(
+        Arc::clone(&state.store),
+        state.network.clone(),
+        state.notify.clone(),
+        pubkey_hex,
+    );
     Ok(())
 }
 
