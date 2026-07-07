@@ -174,6 +174,40 @@ async fn restart_unlock_restores_chain_and_subscriptions() {
         .await;
 }
 
+/// unlock 時の DHT 回収: A のオフライン中にフォロー相手 B が投稿し、B の
+/// 再 publish なしに A の再起動 + unlock だけで取りこぼしがタイムラインに
+/// 現れる。gossipsub は過去分を再送しないため、unlock 時に全フォロー相手へ
+/// 起動する resolve(spawn_sync_follow_target)が唯一の回収経路。
+#[tokio::test]
+async fn unlock_recovers_missed_posts_via_dht() {
+    let mut a = TestApp::spawn().await;
+    app::setup_account(&a.state, "pass-a".into()).await.unwrap();
+    let b = TestApp::spawn().await;
+    let pk_b = app::setup_account(&b.state, "pass-b".into()).await.unwrap();
+
+    a.connect(&b).await;
+    app::follow_user(&a.state, pk_b.clone()).await.unwrap();
+
+    // A 停止(旧インスタンスの Swarm ごと破棄)中に B が投稿する。
+    // この時点で B は誰とも接続しておらず、レコードは B のローカル DHT ストアにだけある
+    let mut a = a.restart().await;
+    app::create_post(&b.state, "missed while offline".into())
+        .await
+        .unwrap();
+
+    // A 再接続 + unlock。フォロー購読の復元と同時に DHT 回収が走る
+    a.connect(&b).await;
+    app::unlock_account(&a.state, "pass-a".into()).await.unwrap();
+
+    let timeline = a
+        .wait_timeline(|t| {
+            t.iter()
+                .any(|p| p.text == "missed while offline" && p.author == pk_b)
+        })
+        .await;
+    assert_eq!(timeline.len(), 1);
+}
+
 /// 複数フォロー相手の投稿がタイムラインに timestamp 降順でマージされる。
 #[tokio::test]
 async fn timeline_merges_multiple_authors() {

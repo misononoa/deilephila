@@ -16,8 +16,10 @@ use libp2p::Multiaddr;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
-/// イベント待機・ポーリングの上限。CI 等の遅い環境でも耐える値。
-pub const WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+/// イベント待機・ポーリングの上限。unlock 時 DHT 回収のリトライ窓
+/// (3秒×10回 = 最大約27秒、app.rs の spawn_sync_follow_target)を覆い、
+/// CI 等の遅い環境でも耐える値。
+pub const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct TestApp {
     pub state: Arc<AppState>,
