@@ -2,7 +2,7 @@ use cid::Cid;
 use libp2p::PeerId;
 use tracing::debug;
 
-use crate::event::{verify_envelope, EventEnvelope};
+use crate::event::{verify_chain_link, verify_envelope, ChainError, EventEnvelope};
 use crate::head::{record_to_bytes, verify_ipns_record, IpnsRecord};
 use crate::network::NetworkHandle;
 use crate::store::{Store, StoreError};
@@ -134,20 +134,17 @@ pub async fn handle_head_record(
             serde_ipld_dagcbor::from_slice(&raw).map_err(|e| SyncError::Decode(e.to_string()))?;
 
         verify_envelope(&envelope).map_err(|_| SyncError::InvalidSignature)?;
-        if envelope.payload.author.as_ref() != record.payload.name.as_ref() {
-            return Err(SyncError::AuthorMismatch { cid });
-        }
-        if envelope.payload.seq != expected_seq {
-            return Err(SyncError::SeqMismatch {
-                cid,
-                expected: expected_seq,
-                got: envelope.payload.seq,
-            });
-        }
-        let is_genesis = envelope.payload.seq == 0;
-        if is_genesis != envelope.payload.prev.is_none() {
-            return Err(SyncError::BrokenChain { cid });
-        }
+        verify_chain_link(&envelope, record.payload.name.as_ref(), expected_seq).map_err(
+            |e| match e {
+                ChainError::WrongAuthor => SyncError::AuthorMismatch { cid: cid.clone() },
+                ChainError::WrongSeq { expected, got } => SyncError::SeqMismatch {
+                    cid: cid.clone(),
+                    expected,
+                    got,
+                },
+                ChainError::BrokenPrev => SyncError::BrokenChain { cid: cid.clone() },
+            },
+        )?;
 
         cursor = envelope.payload.prev.clone();
         expected_seq = expected_seq.saturating_sub(1);

@@ -80,34 +80,36 @@ pub fn verify_envelope(envelope: &EventEnvelope) -> Result<(), VerifyError> {
 
 #[derive(Debug)]
 pub enum ChainError {
+    /// イベントの author がチェーン所有者と一致しない
+    WrongAuthor,
+    /// seq がチェーン内の期待位置と一致しない
     WrongSeq { expected: u64, got: u64 },
-    WrongPrev,
-    GenesisMustHaveNoPrev,
+    /// genesis(seq=0)に prev がある / 非 genesis に prev がない
+    BrokenPrev,
 }
 
-/// seq 順に並んだ (CID, EventEnvelope) スライスのチェーン連結を検証する。
-/// CID は呼び出し元が envelope_cid() で計算済みのものを渡す。
-pub fn verify_chain(pairs: &[(Cid, EventEnvelope)]) -> Result<(), ChainError> {
-    for (i, (cid, envelope)) in pairs.iter().enumerate() {
-        let expected_seq = i as u64;
-        if envelope.payload.seq != expected_seq {
-            return Err(ChainError::WrongSeq {
-                expected: expected_seq,
-                got: envelope.payload.seq,
-            });
-        }
-        if i == 0 {
-            if envelope.payload.prev.is_some() {
-                return Err(ChainError::GenesisMustHaveNoPrev);
-            }
-        } else {
-            let prev_cid = &pairs[i - 1].0;
-            match &envelope.payload.prev {
-                Some(p) if p == prev_cid => {}
-                _ => return Err(ChainError::WrongPrev),
-            }
-        }
-        let _ = cid; // 将来: CID 自体の一致検証も追加可
+/// チェーン内の1イベントを、期待される位置(author / seq)に対して検証する。
+/// 走査方向に依存しない: 前方 fold でも head からの後方遡行でも、呼び出し元が
+/// 期待値を添えて1イベントずつ呼ぶ。prev の指す先が本当にそのイベントかは、
+/// ブロックを CID で取得・照合する層(network)が保証するためここでは見ない。
+/// 署名検証は別関心なので verify_envelope を併用する。
+pub fn verify_chain_link(
+    envelope: &EventEnvelope,
+    expected_author: &[u8; 32],
+    expected_seq: u64,
+) -> Result<(), ChainError> {
+    if envelope.payload.author.as_ref() != expected_author {
+        return Err(ChainError::WrongAuthor);
+    }
+    if envelope.payload.seq != expected_seq {
+        return Err(ChainError::WrongSeq {
+            expected: expected_seq,
+            got: envelope.payload.seq,
+        });
+    }
+    let is_genesis = envelope.payload.seq == 0;
+    if is_genesis != envelope.payload.prev.is_none() {
+        return Err(ChainError::BrokenPrev);
     }
     Ok(())
 }
@@ -256,47 +258,65 @@ mod tests {
     }
 
     #[test]
-    fn verify_chain_valid() {
+    fn chain_link_valid() {
         init_tracing();
         let identity = Identity::generate();
+        let author = identity.public_key_bytes();
         let chain = build_chain(&identity, 3);
-        assert!(verify_chain(&chain).is_ok());
+        for (i, (_, envelope)) in chain.iter().enumerate() {
+            assert!(verify_chain_link(envelope, &author, i as u64).is_ok());
+        }
     }
 
     #[test]
-    fn verify_chain_wrong_seq() {
+    fn chain_link_wrong_seq() {
         init_tracing();
         let identity = Identity::generate();
+        let author = identity.public_key_bytes();
         let mut chain = build_chain(&identity, 3);
         chain[1].1.payload.seq = 99;
         assert!(matches!(
-            verify_chain(&chain),
-            Err(ChainError::WrongSeq { .. })
+            verify_chain_link(&chain[1].1, &author, 1),
+            Err(ChainError::WrongSeq { expected: 1, got: 99 })
         ));
     }
 
     #[test]
-    fn verify_chain_wrong_prev() {
+    fn chain_link_wrong_author() {
         init_tracing();
         let identity = Identity::generate();
-        let mut chain = build_chain(&identity, 3);
-        chain[1].1.payload.prev = Some(chain[0].0.clone()); // まず正しいCIDで作る
-                                                            // 別の CID で上書き
-        let dummy_cid = bytes_to_cid(b"dummy");
-        chain[1].1.payload.prev = Some(dummy_cid);
-        assert!(matches!(verify_chain(&chain), Err(ChainError::WrongPrev)));
+        let other = Identity::generate();
+        let chain = build_chain(&identity, 1);
+        assert!(matches!(
+            verify_chain_link(&chain[0].1, &other.public_key_bytes(), 0),
+            Err(ChainError::WrongAuthor)
+        ));
     }
 
     #[test]
-    fn verify_chain_genesis_with_prev() {
+    fn chain_link_genesis_with_prev() {
         init_tracing();
         let identity = Identity::generate();
+        let author = identity.public_key_bytes();
         let mut chain = build_chain(&identity, 2);
         let dummy_cid = bytes_to_cid(b"dummy");
         chain[0].1.payload.prev = Some(dummy_cid);
         assert!(matches!(
-            verify_chain(&chain),
-            Err(ChainError::GenesisMustHaveNoPrev)
+            verify_chain_link(&chain[0].1, &author, 0),
+            Err(ChainError::BrokenPrev)
+        ));
+    }
+
+    #[test]
+    fn chain_link_non_genesis_without_prev() {
+        init_tracing();
+        let identity = Identity::generate();
+        let author = identity.public_key_bytes();
+        let mut chain = build_chain(&identity, 2);
+        chain[1].1.payload.prev = None;
+        assert!(matches!(
+            verify_chain_link(&chain[1].1, &author, 1),
+            Err(ChainError::BrokenPrev)
         ));
     }
 }
