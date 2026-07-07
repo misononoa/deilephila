@@ -21,14 +21,17 @@ async function refresh() {
   }
 }
 
-// バックエンドの core タスクが新規イベントを取り込むと timeline-updated が emit される
+// バックエンドが新規イベントを取り込むと timeline-updated が emit される。
+// 必ずリスナー登録 → 初回 refresh の順にする: 登録完了後の emit はイベントで拾い、
+// 登録前に完了した同期(unlock 直後の DHT 回収など)は初回 refresh が DB から読む。
+// 逆順だと refresh とリスナー登録の隙間に emit が落ちて再描画されない
 let unlisten: UnlistenFn | null = null;
 
 onMounted(async () => {
-  await refresh();
   unlisten = await listen("timeline-updated", () => {
     refresh();
   });
+  await refresh();
 });
 
 onUnmounted(() => {

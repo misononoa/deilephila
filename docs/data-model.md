@@ -111,6 +111,10 @@ pub enum EventKind {
 
 headポインタは新規イベント(投稿・編集・削除・プロフィール変更…)のたびに更新し、常にイベントチェーン上の最新のイベントを指す。
 
+- レコードはイベントと同じ canonical DAG-CBOR でシリアライズし、署名対象は payload のシリアライズ済みバイト列とする(IPNS 仕様の protobuf 形式は不採用。経緯は [mvp.md](mvp.md) §4 R1)。
+- `validity` は Unix epoch ミリ秒の絶対時刻。現在時刻が `validity` 以上なら失効(EOL)とみなす。失効済みレコードも署名と `sequence` は検証可能であり、head 解決の候補としては有効([networking.md](networking.md) §4.3)。
+- `display_name` は未設定のとき空文字列とする(SQLite projection と同じ規約)。
+
 ## 3. プロフィール
 
 表示名はユーザーが参照されるたびに必要な高頻度・高価値メタデータである一方、ブロック(イベント)のキャッシュ範囲はクライアント任意([networking.md](networking.md) §3.2)のため、長期オフライン＋全フォロワーのキャッシュ失効で、普通の投稿と同じ扱いだと表示名すら取得できなくなるという問題がある。これを避けるため、重要度に応じて可用性を階層化する。
@@ -152,6 +156,7 @@ projection は純粋な関数(`events` の fold)なので、DBが壊れても `e
 | `events` | 検証済み生イベント(チェーンそのもの。検証は挿入前に実施) | cid, author, seq, prev_cid, timestamp, kind_tag, kind_json, raw_cbor(DAG-CBOR 原文 — ブロック提供と再検証の源泉) |
 | `posts` | `Post`+`Edit`+`Delete` を fold した表示用投稿 | cid(=生成イベント), author, seq, text(編集適用後), timestamp, edited, deleted, latest_edit_seq(last-write-wins 判定用) |
 | `accounts` | プロフィール fold 結果 + head 記録 | pubkey, display_name, bio, latest_head_cid, last_seen |
+| `head_records` | 最新 IPNS-headレコードの常時保持(自分 + フォロー相手。[networking.md](networking.md) §3.2) | pubkey, sequence, record_bytes(署名済みレコードの DAG-CBOR 原文), updated_at |
 | `follows` | フォローリスト | pubkey, since |
 | `peers` | ピア情報 | peer_id, multiaddrs, last_connected |
 

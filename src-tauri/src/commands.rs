@@ -3,14 +3,15 @@ use std::sync::Arc;
 
 use cid::Cid;
 use serde::Serialize;
+use tauri::Emitter;
 use tokio::sync::Mutex;
 
 use crate::event::{envelope_cid, EventKind};
-use crate::head::create_head_announce;
+use crate::head::{create_ipns_record, record_to_bytes, IpnsRecord, RECORD_LIFETIME_MS};
 use crate::identity::{create_envelope, Identity};
 use crate::keystore::Keystore;
 use crate::network::NetworkHandle;
-use crate::store::{bytes_to_hex, PostRow, Store, TimelineRow};
+use crate::store::{bytes_to_hex, hex_to_pubkey, PostRow, Store, TimelineRow};
 
 // --- ヘルパー ---
 
@@ -38,6 +39,128 @@ fn normalize_pubkey_hex(input: &str) -> Result<String, String> {
         return Err("public key must be a 64-char hex string".to_string());
     }
     Ok(s)
+}
+
+// --- IPNS-headレコードの発行 ---
+
+/// 定期 republish の周期。EOL(`RECORD_LIFETIME_MS` = 48時間)の 1/4 で、
+/// オンライン中にレコードが失効しない余裕を持たせる(networking.md §4.2)。
+pub const REPUBLISH_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(12 * 60 * 60);
+
+/// 自アカウントの IPNS-headレコードを組み立てる。表示名と最新 Profile イベント
+/// CID のスナップショットを projection から取得して同梱する(data-model.md §3 Tier 0)。
+async fn build_head_record(
+    store: &Store,
+    identity: &Identity,
+    sequence: u64,
+    head_cid: Cid,
+) -> Result<IpnsRecord, String> {
+    let pubkey_hex = bytes_to_hex(&identity.public_key_bytes());
+    let display_name = store
+        .get_account(&pubkey_hex)
+        .await
+        .cmd()?
+        .map(|a| a.display_name)
+        .unwrap_or_default();
+    let profile_cid = store
+        .get_latest_profile_cid(&pubkey_hex)
+        .await
+        .cmd()?
+        .and_then(|s| s.parse::<Cid>().ok());
+    Ok(create_ipns_record(
+        identity,
+        sequence,
+        head_cid,
+        now_ms() + RECORD_LIFETIME_MS,
+        profile_cid,
+        display_name,
+    ))
+}
+
+/// 自レコードを head_records に保存し(再提供と M6 `GetLatestHead` 応答の源泉)、
+/// gossipsub+DHT の両経路へ publish する。
+async fn store_and_publish_head_record(
+    store: &Store,
+    network: &NetworkHandle,
+    record: IpnsRecord,
+) -> Result<(), String> {
+    let pubkey_hex = bytes_to_hex(record.payload.name.as_ref());
+    store
+        .upsert_head_record(
+            &pubkey_hex,
+            record.payload.sequence,
+            &record_to_bytes(&record),
+            now_ms(),
+        )
+        .await
+        .cmd()?;
+    network.publish_head(record).await;
+    Ok(())
+}
+
+/// フォロー相手の最新レコードを DHT から解決し、チェーンを取り込むバックグラウンド
+/// タスクを起動する(networking.md §4.2)。新規フォロー時と unlock 時(オフライン中の
+/// 取りこぼし回収。gossipsub は過去分を再送しない)の両方から呼ばれる。
+/// 起動直後はピア接続とルーティングテーブルが形成途中で解決に失敗しうるため、
+/// しばらくリトライする。新規イベントを取り込んだら timeline-updated を emit する。
+fn spawn_resolve_and_sync(
+    app: tauri::AppHandle,
+    store: Arc<Store>,
+    network: NetworkHandle,
+    pubkey_hex: String,
+) {
+    let Some(pubkey_bytes) = hex_to_pubkey(&pubkey_hex) else {
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+        let mut resolved = None;
+        for _ in 0..10 {
+            if let Some(record) = network.resolve_ipns(pubkey_bytes).await {
+                resolved = Some(record);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+        let Some(record) = resolved else {
+            tracing::debug!("no head record in DHT for {pubkey_hex}");
+            return;
+        };
+        match crate::sync::handle_head_record(&store, &network, &record, None).await {
+            Ok(outcome) if outcome.new_events > 0 => {
+                if let Err(e) = app.emit("timeline-updated", ()) {
+                    tracing::warn!("emit timeline-updated failed: {e}");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("dht sync failed for {pubkey_hex}: {e}"),
+        }
+    });
+}
+
+/// 自分の最新 head のレコードを validity を更新して再発行する。
+/// unlock 時と定期 republish タスク(`REPUBLISH_INTERVAL` 周期、lib.rs)から呼ばれる。
+/// 未アンロック・head 未作成なら何もしない。戻り値は publish したかどうか。
+pub async fn republish_head(state: &AppState) -> Result<bool, String> {
+    let record = {
+        let guard = state.account.lock().await;
+        let Some(account) = guard.as_ref() else {
+            return Ok(false);
+        };
+        let Some(head_cid) = account.head_cid.clone() else {
+            return Ok(false);
+        };
+        // head_cid が Some なら next_seq >= 1 なので -1 は安全
+        build_head_record(
+            &state.store,
+            &account.identity,
+            account.next_seq - 1,
+            head_cid,
+        )
+        .await?
+    };
+    store_and_publish_head_record(&state.store, &state.network, record).await?;
+    Ok(true)
 }
 
 // --- 公開型 ---
@@ -161,6 +284,7 @@ pub async fn setup_account(
 #[tauri::command]
 pub async fn unlock_account(
     passphrase: String,
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
     let ks = Keystore::load(&passphrase, &state.app_dir).cmd()?;
@@ -179,25 +303,26 @@ pub async fn unlock_account(
         .unwrap_or((0, None));
 
     let identity = ks.into_identity();
-    // head があれば announce を作っておく(再起動時の republish — M5 の定期 republish の先取り。
-    // head_cid が Some なら next_seq >= 1 なので -1 は安全)
-    let announce = head_cid
-        .clone()
-        .map(|cid| create_head_announce(&identity, next_seq - 1, cid));
-
     *state.account.lock().await = Some(ActiveAccount {
         identity,
         next_seq,
         head_cid,
     });
 
-    // フォロー全件の feed トピック購読を復元する
+    // フォロー全件の feed トピック購読を復元し、オフライン中の取りこぼしを
+    // DHT から回収する(gossipsub は過去分を再送しないため resolve が唯一の回収経路)
     for follow in state.store.get_follows().await.cmd()? {
-        state.network.subscribe(follow.pubkey).await;
+        state.network.subscribe(follow.pubkey.clone()).await;
+        spawn_resolve_and_sync(
+            app.clone(),
+            Arc::clone(&state.store),
+            state.network.clone(),
+            follow.pubkey,
+        );
     }
-    if let Some(announce) = announce {
-        state.network.publish_head(announce).await;
-    }
+    // 再起動時の republish: validity を今から48時間に更新したレコードを再発行する
+    // (head 未作成なら no-op)
+    republish_head(state.inner()).await?;
 
     Ok(pubkey_hex)
 }
@@ -231,16 +356,22 @@ pub async fn create_post(
     account.next_seq = seq + 1;
     account.head_cid = Some(cid.clone());
 
-    // 新しい head をフォロワーへ通知(fire-and-forget。購読者ゼロでも失敗扱いにしない)
-    let announce = create_head_announce(&account.identity, seq, cid);
-    state.network.publish_head(announce).await;
+    // 新しい head の IPNS-headレコードを保存し、gossipsub+DHT の両経路へ publish する
+    // (publish 自体は fire-and-forget。購読者ゼロでも失敗扱いにしない)
+    let record = build_head_record(&state.store, &account.identity, seq, cid).await?;
+    store_and_publish_head_record(&state.store, &state.network, record).await?;
 
     Ok(cid_str)
 }
 
-/// 公開鍵(hex)でフォローする。follows へ追加し、feed トピックを購読する。
+/// 公開鍵(hex)でフォローする。follows へ追加し、feed トピックを購読し、
+/// 相手の最新 IPNS-headレコードを DHT から解決してチェーンを取り込む。
 #[tauri::command]
-pub async fn follow_user(pubkey: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+pub async fn follow_user(
+    pubkey: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
     let pubkey_hex = normalize_pubkey_hex(&pubkey)?;
 
     let self_hex = {
@@ -253,7 +384,17 @@ pub async fn follow_user(pubkey: String, state: tauri::State<'_, AppState>) -> R
     }
 
     state.store.add_follow(&pubkey_hex, now_ms()).await.cmd()?;
-    state.network.subscribe(pubkey_hex).await;
+    state.network.subscribe(pubkey_hex.clone()).await;
+
+    // 後発フォロワーの初回同期(networking.md §4.2): gossipsub の次の publish を
+    // 待たず、DHT の永続レコードから過去分を取り込む。DHT クエリは数秒かかり
+    // うるため、コマンドは即座に返しバックグラウンドで実行する
+    spawn_resolve_and_sync(
+        app,
+        Arc::clone(&state.store),
+        state.network.clone(),
+        pubkey_hex,
+    );
     Ok(())
 }
 

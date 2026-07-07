@@ -3,9 +3,16 @@ use libp2p::PeerId;
 use tracing::debug;
 
 use crate::event::{verify_envelope, EventEnvelope};
-use crate::head::{verify_head_announce, HeadAnnounce};
+use crate::head::{record_to_bytes, verify_ipns_record, IpnsRecord};
 use crate::network::NetworkHandle;
 use crate::store::{bytes_to_hex, Store, StoreError};
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 /// 1回の同期で辿るチェーン長の上限(不正な announce による暴走防止)。
 const MAX_SYNC_DEPTH: usize = 10_000;
@@ -63,30 +70,50 @@ pub struct SyncOutcome {
     pub new_events: usize,
 }
 
-/// head 通知を起点にチェーンを同期する(M4 のタイムライン構築の中核)。
+/// IPNS-headレコードを起点にチェーンを同期する(タイムライン構築の中核)。
+/// gossipsub 受信・DHT resolve・(M6 の)フォローグラフ探索のどのソース由来の
+/// レコードもこの1関数に合流する。
 ///
 /// Swarm ループの**外**(core 側タスク)から呼ぶこと。`get_block` は mpsc で
 /// Swarm ループへ往復するため、ループ内から呼ぶとデッドロックする。
 ///
-/// 1. announce の署名を検証(payload 内の pubkey による自己完結検証)
-/// 2. stale 判定: 既知 max seq 以下かつ head ブロック取得済みなら no-op
-/// 3. 後方走査: head から `prev` を辿り、未知ブロックを収集・検証
+/// 1. レコードの署名を検証(payload 内の `name` による自己完結検証)
+/// 2. レコード自体を保存 + 表示名スナップショットを反映。チェーン取得の成否に
+///    依存させない: ブロックが取れなくてもポインタと表示名は生かす
+///    (可用性の床、networking.md §3.2)
+/// 3. stale 判定: 既知 max seq 以下かつ head ブロック取得済みなら no-op
+/// 4. 後方走査: head から `prev` を辿り、未知ブロックを収集・検証
 ///    (署名・author 一致・seq 連続性。CID 一致は network 層で検証済み)
-/// 4. 前方挿入: Edit/Delete の projection 空振りを防ぐため **seq 昇順**で insert
-/// 5. accounts.latest_head_cid を更新
-pub async fn handle_head_announce(
+/// 5. 前方挿入: Edit/Delete の projection 空振りを防ぐため **seq 昇順**で insert
+/// 6. accounts.latest_head_cid を更新
+pub async fn handle_head_record(
     store: &Store,
     network: &NetworkHandle,
-    announce: &HeadAnnounce,
+    record: &IpnsRecord,
     source: Option<PeerId>,
 ) -> Result<SyncOutcome, SyncError> {
-    verify_head_announce(announce).map_err(|_| SyncError::InvalidSignature)?;
+    verify_ipns_record(record).map_err(|_| SyncError::InvalidSignature)?;
 
-    let author_hex = bytes_to_hex(announce.payload.pubkey.as_ref());
-    let head_cid_str = announce.payload.head_cid.to_string();
+    let author_hex = bytes_to_hex(record.payload.name.as_ref());
+    let head_cid_str = record.payload.value.to_string();
+
+    store
+        .upsert_head_record(
+            &author_hex,
+            record.payload.sequence,
+            &record_to_bytes(record),
+            now_ms(),
+        )
+        .await?;
+    if !record.payload.display_name.is_empty() {
+        store
+            .fill_display_name_snapshot(&author_hex, &record.payload.display_name)
+            .await?;
+    }
 
     if let Some((known_seq, _)) = store.get_head(&author_hex).await? {
-        if announce.payload.seq <= known_seq && store.get_raw_block(&head_cid_str).await?.is_some()
+        if record.payload.sequence <= known_seq
+            && store.get_raw_block(&head_cid_str).await?.is_some()
         {
             return Ok(SyncOutcome { new_events: 0 });
         }
@@ -94,8 +121,8 @@ pub async fn handle_head_announce(
 
     // 後方走査(新しい順に収集)
     let mut fetched: Vec<EventEnvelope> = Vec::new();
-    let mut cursor = Some(announce.payload.head_cid.clone());
-    let mut expected_seq = announce.payload.seq;
+    let mut cursor = Some(record.payload.value.clone());
+    let mut expected_seq = record.payload.sequence;
 
     while let Some(cid) = cursor {
         if store.get_raw_block(&cid.to_string()).await?.is_some() {
@@ -113,7 +140,7 @@ pub async fn handle_head_announce(
             serde_ipld_dagcbor::from_slice(&raw).map_err(|e| SyncError::Decode(e.to_string()))?;
 
         verify_envelope(&envelope).map_err(|_| SyncError::InvalidSignature)?;
-        if envelope.payload.author.as_ref() != announce.payload.pubkey.as_ref() {
+        if envelope.payload.author.as_ref() != record.payload.name.as_ref() {
             return Err(SyncError::AuthorMismatch { cid });
         }
         if envelope.payload.seq != expected_seq {
@@ -152,13 +179,25 @@ pub async fn handle_head_announce(
 mod tests {
     use super::*;
     use crate::event::{bytes_to_cid, envelope_cid, EventKind};
-    use crate::head::create_head_announce;
+    use crate::head::{create_ipns_record, RECORD_LIFETIME_MS};
     use crate::identity::{create_envelope, Identity};
     use crate::network::{spawn_swarm_loop, NetworkEvent};
     use libp2p::Multiaddr;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    /// テスト用の最小レコード(プロフィールスナップショットなし)。
+    fn make_record(identity: &Identity, sequence: u64, head_cid: Cid) -> IpnsRecord {
+        create_ipns_record(
+            identity,
+            sequence,
+            head_cid,
+            now_ms() + RECORD_LIFETIME_MS,
+            None,
+            String::new(),
+        )
+    }
 
     /// Post×2 + Edit の3イベントチェーンを store に入れる。
     /// Edit を含むのは「seq 昇順挿入で projection が正しく更新されること」を
@@ -255,18 +294,25 @@ mod tests {
             matches!(e, NetworkEvent::PeerSubscribed { .. })
         })
         .await;
-        let announce = create_head_announce(&identity_a, head_seq, head_cid.clone());
-        handle_a.publish_head(announce).await;
+        let record = create_ipns_record(
+            &identity_a,
+            head_seq,
+            head_cid.clone(),
+            now_ms() + RECORD_LIFETIME_MS,
+            None,
+            "Alice".to_string(),
+        );
+        handle_a.publish_head(record).await;
 
         // B: HeadReceived を受けて同期実行
         let ev = wait_for(&mut events_b, |e| {
             matches!(e, NetworkEvent::HeadReceived { .. })
         })
         .await;
-        let NetworkEvent::HeadReceived { announce, source } = ev else {
+        let NetworkEvent::HeadReceived { record, source } = ev else {
             unreachable!()
         };
-        let outcome = handle_head_announce(&store_b, &handle_b, &announce, Some(source))
+        let outcome = handle_head_record(&store_b, &handle_b, &record, Some(source))
             .await
             .unwrap();
         assert_eq!(outcome.new_events, 3);
@@ -283,49 +329,113 @@ mod tests {
         // head が accounts に記録されている
         let account = store_b.get_account(&pubkey_hex).await.unwrap().unwrap();
         assert_eq!(account.latest_head_cid, Some(head_cid.to_string()));
+
+        // レコード自体も常時保持され(R2)、表示名スナップショットが反映されている
+        // (チェーンに Profile イベントがないため Tier 0 が埋める)
+        let (stored_seq, _) = store_b.get_head_record(&pubkey_hex).await.unwrap().unwrap();
+        assert_eq!(stored_seq, head_seq);
+        assert_eq!(account.display_name, "Alice");
     }
 
     #[tokio::test]
-    async fn tampered_announce_rejected() {
+    async fn tampered_record_rejected() {
         let store = Store::open_in_memory().await.unwrap();
         let id = Identity::generate();
-        let mut announce = create_head_announce(&id, 5, bytes_to_cid(b"head"));
-        announce.payload.seq = 6; // 改ざん
+        let mut record = make_record(&id, 5, bytes_to_cid(b"head"));
+        record.payload.sequence = 6; // 改ざん
 
-        let err = handle_head_announce(&store, &dummy_network(), &announce, None)
+        let err = handle_head_record(&store, &dummy_network(), &record, None)
             .await
             .unwrap_err();
         assert!(matches!(err, SyncError::InvalidSignature));
 
-        // store は無変更
+        // store は無変更(レコードも保存されない)
         let author_hex = bytes_to_hex(&id.public_key_bytes());
         assert!(store.get_head(&author_hex).await.unwrap().is_none());
+        assert!(store.get_head_record(&author_hex).await.unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn stale_announce_is_noop() {
+    async fn stale_record_is_noop() {
         let store = Store::open_in_memory().await.unwrap();
         let (id, head_cid, head_seq) = seed_chain(&store).await;
 
-        // 既知 seq 以下の announce → ネットワークに触れず no-op
+        // 既知 seq 以下のレコード → ネットワークに触れず no-op
         // (dummy_network で成功すること自体が「取得を試みていない」ことの証明)
-        let announce = create_head_announce(&id, head_seq, head_cid);
-        let outcome = handle_head_announce(&store, &dummy_network(), &announce, None)
+        let record = make_record(&id, head_seq, head_cid);
+        let outcome = handle_head_record(&store, &dummy_network(), &record, None)
             .await
             .unwrap();
         assert_eq!(outcome.new_events, 0);
     }
 
     #[tokio::test]
-    async fn unavailable_block_returns_error() {
+    async fn unavailable_block_keeps_record() {
         let store = Store::open_in_memory().await.unwrap();
         let id = Identity::generate();
-        // 署名は正しいが、指す先のブロックがどこにもない announce
-        let announce = create_head_announce(&id, 0, bytes_to_cid(b"missing"));
+        // 署名は正しいが、指す先のブロックがどこにもないレコード
+        let record = make_record(&id, 0, bytes_to_cid(b"missing"));
 
-        let err = handle_head_announce(&store, &dummy_network(), &announce, None)
+        let err = handle_head_record(&store, &dummy_network(), &record, None)
             .await
             .unwrap_err();
         assert!(matches!(err, SyncError::BlockUnavailable(_)));
+
+        // チェーン取得に失敗してもポインタは保持される(可用性の床)
+        let author_hex = bytes_to_hex(&id.public_key_bytes());
+        assert!(store.get_head_record(&author_hex).await.unwrap().is_some());
+    }
+
+    /// M5c の中核シナリオ: gossipsub を購読していない後発フォロワーが、
+    /// DHT resolve → handle_head_record でチェーン全体と表示名を取得する
+    /// (発信者の publish を受信時に B はオフライン相当 = 未接続・未購読)。
+    #[tokio::test]
+    async fn late_follower_syncs_via_dht() {
+        // A: チェーンを持つ発信者。record を DHT へ publish する
+        let store_a = Arc::new(Store::open_in_memory().await.unwrap());
+        let (identity_a, head_cid, head_seq) = seed_chain(&store_a).await;
+        let pubkey_hex = bytes_to_hex(&identity_a.public_key_bytes());
+        let (handle_a, _events_a, addr_a) = spawn_test_node(Arc::clone(&store_a)).await;
+        let record = create_ipns_record(
+            &identity_a,
+            head_seq,
+            head_cid.clone(),
+            now_ms() + RECORD_LIFETIME_MS,
+            None,
+            "Alice".to_string(),
+        );
+        handle_a.publish_head(record).await;
+
+        // B: 後から接続する空のフォロワー(gossipsub 購読なし)
+        let store_b = Arc::new(Store::open_in_memory().await.unwrap());
+        let (handle_b, mut events_b, _) = spawn_test_node(Arc::clone(&store_b)).await;
+        handle_b.dial(addr_a).await;
+        wait_for(&mut events_b, |e| {
+            matches!(e, NetworkEvent::PeerConnected(_))
+        })
+        .await;
+
+        // DHT からレコードを解決(ルーティングテーブル形成を待ってリトライ)
+        let mut resolved = None;
+        for _ in 0..40 {
+            if let Some(r) = handle_b.resolve_ipns(identity_a.public_key_bytes()).await {
+                resolved = Some(r);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let resolved = resolved.expect("record not resolvable via DHT");
+
+        // 解決したレコードからチェーン全体を同期
+        let outcome = handle_head_record(&store_b, &handle_b, &resolved, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.new_events, 3);
+
+        let posts = store_b.get_posts_by_author(&pubkey_hex).await.unwrap();
+        assert_eq!(posts.len(), 2);
+        let account = store_b.get_account(&pubkey_hex).await.unwrap().unwrap();
+        assert_eq!(account.latest_head_cid, Some(head_cid.to_string()));
+        assert_eq!(account.display_name, "Alice");
     }
 }

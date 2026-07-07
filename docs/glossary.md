@@ -65,7 +65,6 @@ deilephila の設計・実装で用いる用語を定義し、表記と文書の
 | 正準 | 識別子・英語 | 定義 | 詳説 |
 |------|------------|------|------|
 | IPNS-headレコード | `IpnsRecord` | head を指す署名付き可変ポインタ。 | [data-model.md](data-model.md) §2.4 |
-| head 通知 | `HeadAnnounce` | 最小署名付き head 通知(`seq` / `pubkey` / `head_cid` + 署名)。IPNS-headレコードの前方互換サブセット(導入段階は [mvp.md](mvp.md) §3)。 | [mvp.md](mvp.md) §3 |
 | IPNS名 | `name` | レコードの名前。アカウント公開鍵から導出。 | [data-model.md](data-model.md) §2.4 |
 | value | `value` | IPNS-headレコードが指す値(= `head_cid`)。 | [data-model.md](data-model.md) §2.4 |
 | validity | `validity` / EOL | レコードが失効する時刻(EOL)。失効前にオンライン中 `republish` する。 | [data-model.md](data-model.md) §2.4 |

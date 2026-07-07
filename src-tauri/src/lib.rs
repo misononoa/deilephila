@@ -74,18 +74,19 @@ pub fn run() {
                 }
             }
 
-            // core タスク: NetworkEvent を消費し、head 通知が来たらチェーン同期を実行。
-            // 新規イベントを取り込んだらフロントへ timeline-updated を通知する。
+            // core タスク: NetworkEvent を消費し、IPNS-headレコードが届いたら
+            // チェーン同期を実行。新規イベントを取り込んだらフロントへ
+            // timeline-updated を通知する。
             if let Some(mut event_rx) = event_rx {
                 let store = Arc::clone(&store);
                 let network = network_handle.clone();
                 let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     while let Some(event) = event_rx.recv().await {
-                        let NetworkEvent::HeadReceived { announce, source } = event else {
+                        let NetworkEvent::HeadReceived { record, source } = event else {
                             continue;
                         };
-                        match sync::handle_head_announce(&store, &network, &announce, Some(source))
+                        match sync::handle_head_record(&store, &network, &record, Some(source))
                             .await
                         {
                             Ok(outcome) if outcome.new_events > 0 => {
@@ -101,6 +102,23 @@ pub fn run() {
             }
 
             app.manage(AppState::new(store, app_dir, network_handle));
+
+            // 定期 republish タスク: EOL(48時間)の失効前に validity を更新した
+            // レコードを再発行し、DHT 上のポインタを生存させる(networking.md §4.2)。
+            // unlock 時の発行と対になる(commands::republish_head)
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(commands::REPUBLISH_INTERVAL).await;
+                    let state = app_handle.state::<AppState>();
+                    match commands::republish_head(state.inner()).await {
+                        Ok(true) => tracing::info!("head record republished"),
+                        Ok(false) => {}
+                        Err(e) => tracing::warn!("head republish failed: {e}"),
+                    }
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

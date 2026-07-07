@@ -367,10 +367,101 @@ impl Store {
         // seq は不変条件上 ≥0 なので i64 → u64 キャストは安全
         Ok(row.map(|r| (r.seq as u64, Some(r.cid))))
     }
+
+    /// IPNS-headレコードを保存する。既知 sequence 以下のレコードは無視する(冪等)。
+    /// フォロー相手 + 自分の最新レコードの常時保持([networking.md] §3.2)の実体で、
+    /// M6 の GetLatestHead 応答の源泉にもなる。
+    pub async fn upsert_head_record(
+        &self,
+        pubkey_hex: &str,
+        sequence: u64,
+        record_bytes: &[u8],
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        let seq = sequence as i64;
+        sqlx::query!(
+            "INSERT INTO head_records (pubkey, sequence, record_bytes, updated_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(pubkey) DO UPDATE SET
+                 sequence = excluded.sequence,
+                 record_bytes = excluded.record_bytes,
+                 updated_at = excluded.updated_at
+             WHERE excluded.sequence > head_records.sequence",
+            pubkey_hex,
+            seq,
+            record_bytes,
+            now_ms
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 保持中の最新 IPNS-headレコードを (sequence, レコードのバイト列) で返す。
+    pub async fn get_head_record(
+        &self,
+        pubkey_hex: &str,
+    ) -> Result<Option<(u64, Vec<u8>)>, StoreError> {
+        let row = sqlx::query!(
+            "SELECT sequence, record_bytes FROM head_records WHERE pubkey = ?",
+            pubkey_hex
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| (r.sequence as u64, r.record_bytes)))
+    }
+
+    /// IPNS-headレコードの display_name スナップショット(Tier 0)を accounts に
+    /// 反映する。チェーンの Profile fold が正典なので、未設定(空)のときだけ埋める
+    /// ([data-model.md] §3: 不一致時はチェーンが勝つ)。
+    pub async fn fill_display_name_snapshot(
+        &self,
+        pubkey_hex: &str,
+        display_name: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query!(
+            "INSERT INTO accounts (pubkey, display_name) VALUES (?, ?)
+             ON CONFLICT(pubkey) DO UPDATE SET display_name = excluded.display_name
+             WHERE accounts.display_name = ''",
+            pubkey_hex,
+            display_name
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// チェーン上最新の Profile イベントの CID(レコードの profile_cid スナップショット用)。
+    pub async fn get_latest_profile_cid(
+        &self,
+        pubkey_hex: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let row = sqlx::query!(
+            "SELECT cid FROM events
+             WHERE author = ? AND kind_tag = 'Profile'
+             ORDER BY seq DESC LIMIT 1",
+            pubkey_hex
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.cid))
+    }
 }
 
 pub fn bytes_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// 64桁 hex を公開鍵バイト列へ変換する(不正な形式は None)。
+pub fn hex_to_pubkey(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 fn kind_tag_str(kind: &EventKind) -> &'static str {
