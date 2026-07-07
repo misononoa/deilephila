@@ -132,7 +132,7 @@ Application Core  ──(mpsc: NetworkCommand)──▶  Swarmループ
 Application Core  ◀──(mpsc: NetworkEvent)───  Swarmループ
 ```
 
-- `NetworkCommand`: `PublishHead`(署名付き IPNS-headレコードを gossipsub+DHT へ同時搬送), `ResolveIpns(PubKey)`(DHTから取得), `QueryLatestHead(PubKey)`(フォローグラフ探索 §4.3), `GetBlock { cid, prefer }`(prefer = ブロックを持つ見込みが高いピアを優先), `Subscribe { pubkey_hex }`, `Unsubscribe { pubkey_hex }`, `Dial(Multiaddr)`。
+- `NetworkCommand`: `PublishHead`(署名付き IPNS-headレコードを gossipsub+DHT へ同時搬送), `ResolveIpns(PubKey)`(DHTから取得), `QueryLatestHead(PubKey)`(フォローグラフ探索 §4.3), `GetBlock { cid, prefer }`(prefer = ブロックを持つ見込みが高いピアを優先。NotFound や送信失敗時は残りの接続中ピアへ順に問い合わせ、全候補が尽きたら失敗を返す), `Subscribe { pubkey_hex }`, `Unsubscribe { pubkey_hex }`, `Dial(Multiaddr)`。
 - `NetworkEvent`: `HeadReceived { record, source }`(ソース問わず候補として通知。署名検証は受け手の同期処理で実施), `PeerConnected`, `PeerDiscovered`, `PeerSubscribed`。
 - 各コマンド/イベントを導入するマイルストーンは [mvp.md](mvp.md) §3 を参照。
 - 受信ブロックの永続化はネットワーク層では行わない(CID 一致の検証と転送のみ)。チェーン検証と seq 昇順での取り込みは Application Core 側の同期処理が担う([data-model.md](data-model.md) §6)。

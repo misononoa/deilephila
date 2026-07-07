@@ -213,6 +213,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_block_falls_back_to_other_peers() {
+        // ブロックを持たない空ノード E と保持ノード A の両方に接続した状態で、
+        // 最初に問い合わせたピアが E でもフォールバックで A から取得できること。
+        // (フォールバック導入前は「接続リスト先頭のピアの保持状況」次第で失敗した)
+        let identity = Identity::generate();
+        let envelope = create_envelope(
+            &identity,
+            0,
+            None,
+            EventKind::Post {
+                text: "fallback".to_string(),
+            },
+        );
+        let cid = envelope_cid(&envelope);
+
+        let store_a = Arc::new(Store::open_in_memory().await.unwrap());
+        store_a.insert_event(&envelope).await.unwrap();
+        let (_handle_a, _, addr_a) = spawn_test_node(Arc::clone(&store_a)).await;
+
+        let store_e = Arc::new(Store::open_in_memory().await.unwrap());
+        let (_handle_e, _, addr_e) = spawn_test_node(store_e).await;
+
+        let store_b = Arc::new(Store::open_in_memory().await.unwrap());
+        let (handle_b, mut events_b, _) = spawn_test_node(store_b).await;
+
+        // 空ノード E に先に接続してから A に接続する
+        handle_b.dial(addr_e).await;
+        wait_for(&mut events_b, |e| {
+            matches!(e, NetworkEvent::PeerConnected(_))
+        })
+        .await;
+        handle_b.dial(addr_a).await;
+        wait_for(&mut events_b, |e| {
+            matches!(e, NetworkEvent::PeerConnected(_))
+        })
+        .await;
+
+        let received = handle_b
+            .get_block(cid.clone(), None)
+            .await
+            .expect("get_block failed despite a holder being connected");
+        let recovered: EventEnvelope = serde_ipld_dagcbor::from_slice(&received).unwrap();
+        assert_eq!(envelope_cid(&recovered), cid);
+    }
+
+    #[tokio::test]
     async fn test_mdns_peer_discovery() {
         let store_a = Arc::new(Store::open_in_memory().await.unwrap());
         let store_b = Arc::new(Store::open_in_memory().await.unwrap());

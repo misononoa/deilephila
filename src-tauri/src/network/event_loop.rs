@@ -54,9 +54,8 @@ pub(crate) async fn run_swarm_loop(
     }
 
     let mut addr_tx_opt = Some(addr_tx);
-    // request_id → (expected_cid, reply_channel)
-    let mut pending: HashMap<OutboundRequestId, (Cid, oneshot::Sender<Option<Vec<u8>>>)> =
-        HashMap::new();
+    // request_id → 取得中ブロックの進行状態
+    let mut pending: HashMap<OutboundRequestId, PendingBlock> = HashMap::new();
     // DHT get_record クエリ → (reply_channel, 収集済み候補)
     let mut pending_resolves: HashMap<
         kad::QueryId,
@@ -71,18 +70,20 @@ pub(crate) async fn run_swarm_loop(
                     let _ = swarm.dial(addr);
                 }
                 Some(NetworkCommand::GetBlock { cid, prefer, reply }) => {
-                    let peers: Vec<PeerId> = swarm.connected_peers().cloned().collect();
-                    // prefer が接続中ならそれを、なければ任意の接続先を選ぶ
-                    let target = prefer
-                        .filter(|p| peers.contains(p))
-                        .or_else(|| peers.first().cloned());
-                    let Some(peer) = target else {
-                        let _ = reply.send(None);
-                        continue;
-                    };
-                    let req = WantBlock { cid_bytes: cid.to_bytes() };
-                    let req_id = swarm.behaviour_mut().exchange.send_request(&peer, req);
-                    pending.insert(req_id, (cid, reply));
+                    // prefer(ブロックを持つ見込みが高いピア)を先頭候補に、
+                    // 残りの接続中ピアを後続候補とする。NotFound や送信失敗の
+                    // たびに次の候補へフォールバックする(ブロックを持たない
+                    // ピアと接続していても、保持ピアがいれば取得できる)
+                    let mut candidates: Vec<PeerId> = Vec::new();
+                    if let Some(p) = prefer.filter(|p| swarm.is_connected(p)) {
+                        candidates.push(p);
+                    }
+                    for p in swarm.connected_peers() {
+                        if !candidates.contains(p) {
+                            candidates.push(*p);
+                        }
+                    }
+                    request_block_from_next(&mut swarm, &mut pending, cid, reply, candidates);
                 }
                 Some(NetworkCommand::PublishHead(record)) => {
                     publish_head_record(&mut swarm, &record);
@@ -153,8 +154,22 @@ pub(crate) async fn run_swarm_loop(
                         request_id,
                         response,
                     } => {
-                        if let Some((expected_cid, reply)) = pending.remove(&request_id) {
-                            handle_block_response(response, expected_cid, reply);
+                        if let Some(PendingBlock { cid, reply, remaining }) =
+                            pending.remove(&request_id)
+                        {
+                            match verify_block_response(response, &cid) {
+                                Some(data) => {
+                                    let _ = reply.send(Some(data));
+                                }
+                                // NotFound / CID 不一致は次の候補ピアへ
+                                None => request_block_from_next(
+                                    &mut swarm,
+                                    &mut pending,
+                                    cid,
+                                    reply,
+                                    remaining,
+                                ),
+                            }
                         }
                     }
                 },
@@ -202,8 +217,11 @@ pub(crate) async fn run_swarm_loop(
                     },
                 ))) => {
                     warn!("outbound request failed: {error}");
-                    if let Some((_, reply)) = pending.remove(&request_id) {
-                        let _ = reply.send(None);
+                    // 送信失敗(切断済みピア等)も次の候補ピアへフォールバック
+                    if let Some(PendingBlock { cid, reply, remaining }) =
+                        pending.remove(&request_id)
+                    {
+                        request_block_from_next(&mut swarm, &mut pending, cid, reply, remaining);
                     }
                 }
                 _ => {}
@@ -212,27 +230,56 @@ pub(crate) async fn run_swarm_loop(
     }
 }
 
-/// 受信ブロックの CID 一致を検証して返す。
+/// GetBlock の進行状態。`remaining` は未試行の候補ピアで、NotFound や
+/// 送信失敗のたびに先頭から消費してフォールバックする。
+struct PendingBlock {
+    cid: Cid,
+    reply: oneshot::Sender<Option<Vec<u8>>>,
+    remaining: Vec<PeerId>,
+}
+
+/// 候補の先頭ピアへ WantBlock を送り pending に登録する。候補が尽きていたら
+/// None を返して取得失敗とする。
+fn request_block_from_next(
+    swarm: &mut libp2p::Swarm<DeilephilaBehaviour>,
+    pending: &mut HashMap<OutboundRequestId, PendingBlock>,
+    cid: Cid,
+    reply: oneshot::Sender<Option<Vec<u8>>>,
+    mut remaining: Vec<PeerId>,
+) {
+    if remaining.is_empty() {
+        let _ = reply.send(None);
+        return;
+    }
+    let peer = remaining.remove(0);
+    let req = WantBlock {
+        cid_bytes: cid.to_bytes(),
+    };
+    let req_id = swarm.behaviour_mut().exchange.send_request(&peer, req);
+    pending.insert(
+        req_id,
+        PendingBlock {
+            cid,
+            reply,
+            remaining,
+        },
+    );
+}
+
+/// 受信ブロックの CID 一致を検証して返す(NotFound・CID 不一致は None)。
 /// 永続化は行わない: チェーン同期では Edit/Delete が対象 Post より先に届きうるため、
 /// 挿入順の制御(seq 昇順)は同期エンジン(sync.rs)が担う。
-fn handle_block_response(
-    response: BlockResponse,
-    expected_cid: Cid,
-    reply: oneshot::Sender<Option<Vec<u8>>>,
-) {
+fn verify_block_response(response: BlockResponse, expected_cid: &Cid) -> Option<Vec<u8>> {
     match response {
-        BlockResponse::NotFound => {
-            let _ = reply.send(None);
-        }
+        BlockResponse::NotFound => None,
         BlockResponse::Found { data } => {
             // CID 検証: 受信データから再計算したCIDが期待値と一致するか
             let computed = bytes_to_cid(&data);
-            if computed != expected_cid {
+            if computed != *expected_cid {
                 warn!("CID mismatch: expected {expected_cid}, got {computed}");
-                let _ = reply.send(None);
-                return;
+                return None;
             }
-            let _ = reply.send(Some(data));
+            Some(data)
         }
     }
 }
