@@ -159,9 +159,12 @@ mod tests {
     use super::*;
     use crate::{
         event::{envelope_cid, EventEnvelope, EventKind},
-        head::verify_ipns_record,
+        head::{feed_topic_str, verify_ipns_record},
         identity::{create_envelope, Identity},
-        testutil::{far_future_ms, make_record, resolve_with_retry, spawn_test_node, wait_for},
+        testutil::{
+            far_future_ms, make_record, resolve_with_retry, spawn_test_node, wait_for,
+            wait_subscribed,
+        },
         util::bytes_to_hex,
     };
     use std::time::Duration;
@@ -373,18 +376,8 @@ mod tests {
 
         handle_b.dial(addr_a).await;
         wait_peer_connected_ev(&mut events_b).await;
-        handle_b.subscribe(pubkey_hex).await;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match events_a.recv().await {
-                    Some(NetworkEvent::PeerSubscribed { .. }) => return,
-                    Some(_) => continue,
-                    None => panic!("event channel closed"),
-                }
-            }
-        })
-        .await
-        .expect("subscription not propagated");
+        handle_b.subscribe(pubkey_hex.clone()).await;
+        wait_subscribed(&mut events_a, &feed_topic_str(&pubkey_hex)).await;
 
         handle_a.publish_head(make_record(&id, 2, far_future_ms())).await;
 

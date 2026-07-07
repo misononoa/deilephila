@@ -147,10 +147,10 @@ pub async fn handle_head_record(
 mod tests {
     use super::*;
     use crate::event::{envelope_cid, EventKind};
-    use crate::head::{create_ipns_record, RECORD_LIFETIME_MS};
+    use crate::head::{create_ipns_record, feed_topic_str, RECORD_LIFETIME_MS};
     use crate::identity::{create_envelope, Identity};
     use crate::network::NetworkEvent;
-    use crate::testutil::{make_record_pointing, spawn_test_node, wait_for};
+    use crate::testutil::{make_record_pointing, spawn_test_node, wait_for, wait_subscribed};
     use crate::util::bytes_to_cid;
     use std::sync::Arc;
     use std::time::Duration;
@@ -222,10 +222,7 @@ mod tests {
         handle_b.subscribe(pubkey_hex.clone()).await;
 
         // A: B の購読が伝わるのを待ってから publish(gossipsub の購読情報は接続上で交換される)
-        wait_for(&mut events_a, |e| {
-            matches!(e, NetworkEvent::PeerSubscribed { .. })
-        })
-        .await;
+        wait_subscribed(&mut events_a, &feed_topic_str(&pubkey_hex)).await;
         let record = create_ipns_record(
             &identity_a,
             head_seq,

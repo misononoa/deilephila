@@ -80,6 +80,16 @@ pub async fn wait_for(
     .expect("timed out waiting for network event")
 }
 
+/// 指定トピックの購読が伝わるまで待つ。並列実行中の他テストのノードが
+/// loopback mDNS で相互接続してくるため、トピック無指定の PeerSubscribed 待ちは
+/// 無関係な購読で誤発火し、購読者不在のまま publish してしまう。
+pub async fn wait_subscribed(rx: &mut mpsc::Receiver<NetworkEvent>, topic: &str) {
+    wait_for(rx, |e| {
+        matches!(e, NetworkEvent::PeerSubscribed { topic: t, .. } if t == topic)
+    })
+    .await;
+}
+
 /// put の伝播や identify によるルーティングテーブル形成を待つため、
 /// 解決できるまでリトライする(上限 ~10 秒)。
 pub async fn resolve_with_retry(handle: &NetworkHandle, pubkey: [u8; 32]) -> Option<IpnsRecord> {
