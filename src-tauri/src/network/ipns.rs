@@ -56,26 +56,15 @@ pub(crate) fn validate_inbound_head_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::head::{create_ipns_record, record_to_bytes, IpnsRecord};
+    use crate::head::record_to_bytes;
     use crate::identity::Identity;
-    use crate::util::bytes_to_cid;
-
-    fn make_record(identity: &Identity, sequence: u64) -> IpnsRecord {
-        create_ipns_record(
-            identity,
-            sequence,
-            bytes_to_cid(b"head block"),
-            now_ms() + 3_600_000,
-            None,
-            "Alice".to_string(),
-        )
-    }
+    use crate::testutil::{far_future_ms, make_record};
 
     #[test]
     fn inbound_record_validation_rules() {
         let id = Identity::generate();
         let pubkey = id.public_key_bytes();
-        let record = make_record(&id, 5);
+        let record = make_record(&id, 5, far_future_ms());
         let kad_record = kad::Record {
             key: head_record_key(&pubkey),
             value: record_to_bytes(&record),

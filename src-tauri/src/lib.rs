@@ -7,6 +7,8 @@ pub mod keystore;
 pub mod network;
 pub mod store;
 pub mod sync;
+#[cfg(test)]
+mod testutil;
 pub mod util;
 
 use std::path::PathBuf;

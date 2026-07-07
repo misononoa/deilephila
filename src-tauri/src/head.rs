@@ -131,23 +131,12 @@ pub fn feed_topic_str(pubkey_hex: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::make_record;
     use crate::util::bytes_to_cid;
 
     #[test]
     fn topic_name_format() {
         assert_eq!(feed_topic_str("ab01"), "deilephila/feed/ab01");
-    }
-
-    /// display_name とプロフィール CID 入りの代表的なレコードを作る。
-    fn make_record(identity: &Identity, sequence: u64, validity: i64) -> IpnsRecord {
-        create_ipns_record(
-            identity,
-            sequence,
-            bytes_to_cid(b"head block"),
-            validity,
-            Some(bytes_to_cid(b"profile block")),
-            "Alice".to_string(),
-        )
     }
 
     #[test]

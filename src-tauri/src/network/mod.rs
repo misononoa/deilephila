@@ -159,31 +159,12 @@ mod tests {
     use super::*;
     use crate::{
         event::{envelope_cid, EventEnvelope, EventKind},
-        head::{create_ipns_record, verify_ipns_record},
+        head::verify_ipns_record,
         identity::{create_envelope, Identity},
-        util::{bytes_to_cid, bytes_to_hex, now_ms},
+        testutil::{far_future_ms, make_record, resolve_with_retry, spawn_test_node, wait_for},
+        util::bytes_to_hex,
     };
     use std::time::Duration;
-
-    async fn spawn_test_node(
-        store: Arc<Store>,
-    ) -> (NetworkHandle, mpsc::Receiver<NetworkEvent>, Multiaddr) {
-        // テストでは 127.0.0.1 を使う(0.0.0.0 はダイアル先として使えないため)
-        let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
-        spawn_swarm_loop(store, Some(listen))
-            .await
-            .expect("swarm failed to start")
-    }
-
-    async fn wait_peer_connected(event_rx: &mut mpsc::Receiver<NetworkEvent>) {
-        loop {
-            match event_rx.recv().await {
-                Some(NetworkEvent::PeerConnected(_)) => return,
-                Some(_) => continue,
-                None => panic!("event channel closed before PeerConnected"),
-            }
-        }
-    }
 
     #[tokio::test]
     async fn test_block_exchange_direct_dial() {
@@ -211,9 +192,10 @@ mod tests {
 
         // B → A にダイアルして接続を待つ
         handle_b.dial(addr_a).await;
-        tokio::time::timeout(Duration::from_secs(5), wait_peer_connected(&mut events_b))
-            .await
-            .expect("peer connection timed out");
+        wait_for(&mut events_b, |e| {
+            matches!(e, NetworkEvent::PeerConnected(_))
+        })
+        .await;
 
         // B が A からブロックを取得
         let received = handle_b
@@ -269,45 +251,8 @@ mod tests {
 
     // --- IPNS-headレコードの DHT 搬送(M5b) ---
 
-    fn far_future_ms() -> i64 {
-        now_ms() + 3_600_000
-    }
-
-    fn make_record(identity: &Identity, sequence: u64) -> IpnsRecord {
-        create_ipns_record(
-            identity,
-            sequence,
-            bytes_to_cid(b"head block"),
-            far_future_ms(),
-            None,
-            "Alice".to_string(),
-        )
-    }
-
     async fn wait_peer_connected_ev(rx: &mut mpsc::Receiver<NetworkEvent>) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match rx.recv().await {
-                    Some(NetworkEvent::PeerConnected(_)) => return,
-                    Some(_) => continue,
-                    None => panic!("event channel closed before PeerConnected"),
-                }
-            }
-        })
-        .await
-        .expect("peer connection timed out")
-    }
-
-    /// put の伝播や identify によるルーティングテーブル形成を待つため、
-    /// 解決できるまでリトライする(上限 ~10 秒)。
-    async fn resolve_with_retry(handle: &NetworkHandle, pubkey: [u8; 32]) -> Option<IpnsRecord> {
-        for _ in 0..40 {
-            if let Some(record) = handle.resolve_ipns(pubkey).await {
-                return Some(record);
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-        None
+        wait_for(rx, |e| matches!(e, NetworkEvent::PeerConnected(_))).await;
     }
 
     #[tokio::test]
@@ -324,7 +269,7 @@ mod tests {
         wait_peer_connected_ev(&mut events_b).await;
 
         let id = Identity::generate();
-        handle_a.publish_head(make_record(&id, 5)).await;
+        handle_a.publish_head(make_record(&id, 5, far_future_ms())).await;
 
         let resolved = resolve_with_retry(&handle_b, id.public_key_bytes())
             .await
@@ -352,14 +297,14 @@ mod tests {
         wait_peer_connected_ev(&mut events_c).await;
 
         let id = Identity::generate();
-        handle_a.publish_head(make_record(&id, 5)).await;
+        handle_a.publish_head(make_record(&id, 5, far_future_ms())).await;
         let resolved = resolve_with_retry(&handle_b, id.public_key_bytes())
             .await
             .expect("initial record not resolvable");
         assert_eq!(resolved.payload.sequence, 5);
 
         // C が古い(署名は正当な)レコードを DHT に流し込む
-        handle_c.publish_head(make_record(&id, 3)).await;
+        handle_c.publish_head(make_record(&id, 3, far_future_ms())).await;
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         let resolved = resolve_with_retry(&handle_b, id.public_key_bytes())
@@ -381,7 +326,7 @@ mod tests {
         // 署名の合わない改ざんレコードを publish(攻撃者の自ノードには入るが、
         // B の格納前検証と argmax の署名フィルタの両方が弾く)
         let id = Identity::generate();
-        let mut tampered = make_record(&id, 9);
+        let mut tampered = make_record(&id, 9, far_future_ms());
         tampered.payload.sequence = 10;
         handle_a.publish_head(tampered).await;
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -405,7 +350,7 @@ mod tests {
         wait_peer_connected_ev(&mut events_c).await;
 
         let id = Identity::generate();
-        handle_a.publish_head(make_record(&id, 7)).await;
+        handle_a.publish_head(make_record(&id, 7, far_future_ms())).await;
 
         // C の解決: B が複製を返すか、B の紹介で A に到達するかのいずれか
         let resolved = resolve_with_retry(&handle_c, id.public_key_bytes())
@@ -441,7 +386,7 @@ mod tests {
         .await
         .expect("subscription not propagated");
 
-        handle_a.publish_head(make_record(&id, 2)).await;
+        handle_a.publish_head(make_record(&id, 2, far_future_ms())).await;
 
         let record = tokio::time::timeout(Duration::from_secs(10), async {
             loop {

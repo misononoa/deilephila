@@ -147,26 +147,14 @@ pub async fn handle_head_record(
 mod tests {
     use super::*;
     use crate::event::{envelope_cid, EventKind};
-    use crate::util::bytes_to_cid;
     use crate::head::{create_ipns_record, RECORD_LIFETIME_MS};
     use crate::identity::{create_envelope, Identity};
-    use crate::network::{spawn_swarm_loop, NetworkEvent};
-    use libp2p::Multiaddr;
+    use crate::network::NetworkEvent;
+    use crate::testutil::{make_record_pointing, spawn_test_node, wait_for};
+    use crate::util::bytes_to_cid;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::mpsc;
-
-    /// テスト用の最小レコード(プロフィールスナップショットなし)。
-    fn make_record(identity: &Identity, sequence: u64, head_cid: Cid) -> IpnsRecord {
-        create_ipns_record(
-            identity,
-            sequence,
-            head_cid,
-            now_ms() + RECORD_LIFETIME_MS,
-            None,
-            String::new(),
-        )
-    }
 
     /// Post×2 + Edit の3イベントチェーンを store に入れる。
     /// Edit を含むのは「seq 昇順挿入で projection が正しく更新されること」を
@@ -211,31 +199,6 @@ mod tests {
     fn dummy_network() -> NetworkHandle {
         let (tx, _rx) = mpsc::channel(1);
         NetworkHandle::new(tx)
-    }
-
-    async fn spawn_test_node(
-        store: Arc<Store>,
-    ) -> (NetworkHandle, mpsc::Receiver<NetworkEvent>, Multiaddr) {
-        let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
-        spawn_swarm_loop(store, Some(listen))
-            .await
-            .expect("swarm failed to start")
-    }
-
-    async fn wait_for(
-        rx: &mut mpsc::Receiver<NetworkEvent>,
-        pred: impl Fn(&NetworkEvent) -> bool,
-    ) -> NetworkEvent {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let ev = rx.recv().await.expect("event channel closed");
-                if pred(&ev) {
-                    return ev;
-                }
-            }
-        })
-        .await
-        .expect("timed out waiting for network event")
     }
 
     #[tokio::test]
@@ -310,7 +273,7 @@ mod tests {
     async fn tampered_record_rejected() {
         let store = Store::open_in_memory().await.unwrap();
         let id = Identity::generate();
-        let mut record = make_record(&id, 5, bytes_to_cid(b"head"));
+        let mut record = make_record_pointing(&id, 5, bytes_to_cid(b"head"));
         record.payload.sequence = 6; // 改ざん
 
         let err = handle_head_record(&store, &dummy_network(), &record, None)
@@ -331,7 +294,7 @@ mod tests {
 
         // 既知 seq 以下のレコード → ネットワークに触れず no-op
         // (dummy_network で成功すること自体が「取得を試みていない」ことの証明)
-        let record = make_record(&id, head_seq, head_cid);
+        let record = make_record_pointing(&id, head_seq, head_cid);
         let outcome = handle_head_record(&store, &dummy_network(), &record, None)
             .await
             .unwrap();
@@ -343,7 +306,7 @@ mod tests {
         let store = Store::open_in_memory().await.unwrap();
         let id = Identity::generate();
         // 署名は正しいが、指す先のブロックがどこにもないレコード
-        let record = make_record(&id, 0, bytes_to_cid(b"missing"));
+        let record = make_record_pointing(&id, 0, bytes_to_cid(b"missing"));
 
         let err = handle_head_record(&store, &dummy_network(), &record, None)
             .await

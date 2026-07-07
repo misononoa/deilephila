@@ -140,13 +140,7 @@ impl std::fmt::Display for EventKind {
 mod tests {
     use super::*;
     use crate::identity::Identity;
-
-    fn init_tracing() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .with_test_writer()
-            .try_init();
-    }
+    use crate::testutil::init_tracing;
 
     fn make_post_payload(seq: u64, prev: Option<Cid>, author: &Identity) -> EventPayload {
         EventPayload {
