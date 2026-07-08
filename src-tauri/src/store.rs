@@ -132,14 +132,18 @@ impl Store {
                 .execute(&mut *tx)
                 .await?;
             }
+            // Edit/Delete は target が同一 author の Post を指す場合のみ有効
+            // (data-model.md §4)。author 条件がないと、他人の投稿 CID を target に
+            // 指す不正イベントで projection が書き換えられてしまう
             EventKind::Edit { target, text } => {
                 let target_str = target.to_string();
                 sqlx::query!(
                     "UPDATE posts SET text = ?, edited = 1, latest_edit_seq = ?
-                     WHERE cid = ? AND latest_edit_seq < ?",
+                     WHERE cid = ? AND author = ? AND latest_edit_seq < ?",
                     text,
                     seq,
                     target_str,
+                    author,
                     seq
                 )
                 .execute(&mut *tx)
@@ -147,9 +151,13 @@ impl Store {
             }
             EventKind::Delete { target } => {
                 let target_str = target.to_string();
-                sqlx::query!("UPDATE posts SET deleted = 1 WHERE cid = ?", target_str)
-                    .execute(&mut *tx)
-                    .await?;
+                sqlx::query!(
+                    "UPDATE posts SET deleted = 1 WHERE cid = ? AND author = ?",
+                    target_str,
+                    author
+                )
+                .execute(&mut *tx)
+                .await?;
             }
             EventKind::Profile {
                 display_name, bio, ..
@@ -542,6 +550,75 @@ mod tests {
 
         let posts = store.get_posts_by_author(&pubkey_hex).await.unwrap();
         assert!(posts[0].deleted);
+    }
+
+    #[tokio::test]
+    async fn cross_author_edit_is_ignored() {
+        let store = make_store().await;
+        let victim = Identity::generate();
+        let attacker = Identity::generate();
+        let victim_hex = bytes_to_hex(&victim.public_key_bytes());
+
+        let post = create_envelope(
+            &victim,
+            0,
+            None,
+            EventKind::Post {
+                text: "original".to_string(),
+            },
+        );
+        let post_cid = envelope_cid(&post);
+        store.insert_event(&post).await.unwrap();
+
+        // 攻撃者が自分のチェーンに、被害者の投稿を target に指す Edit を載せる。
+        // イベント自体は正当(署名・チェーン構造OK)なので保存はされるが、
+        // fold では無視される(data-model.md §4)
+        let forged_edit = create_envelope(
+            &attacker,
+            0,
+            None,
+            EventKind::Edit {
+                text: "hacked".to_string(),
+                target: post_cid,
+            },
+        );
+        store.insert_event(&forged_edit).await.unwrap();
+
+        let posts = store.get_posts_by_author(&victim_hex).await.unwrap();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].text, "original");
+        assert!(!posts[0].edited);
+    }
+
+    #[tokio::test]
+    async fn cross_author_delete_is_ignored() {
+        let store = make_store().await;
+        let victim = Identity::generate();
+        let attacker = Identity::generate();
+        let victim_hex = bytes_to_hex(&victim.public_key_bytes());
+
+        let post = create_envelope(
+            &victim,
+            0,
+            None,
+            EventKind::Post {
+                text: "keep me".to_string(),
+            },
+        );
+        let post_cid = envelope_cid(&post);
+        store.insert_event(&post).await.unwrap();
+
+        let forged_delete = create_envelope(
+            &attacker,
+            0,
+            None,
+            EventKind::Delete { target: post_cid },
+        );
+        store.insert_event(&forged_delete).await.unwrap();
+
+        let posts = store.get_posts_by_author(&victim_hex).await.unwrap();
+        assert_eq!(posts.len(), 1);
+        assert!(!posts[0].deleted);
     }
 
     #[tokio::test]
