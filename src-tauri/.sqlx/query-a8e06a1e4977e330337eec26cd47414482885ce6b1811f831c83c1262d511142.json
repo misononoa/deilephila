@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO head_records (pubkey, sequence, validity, record_bytes, updated_at)\n             VALUES (?, ?, ?, ?, ?)\n             ON CONFLICT(pubkey) DO UPDATE SET\n                 sequence = excluded.sequence,\n                 validity = excluded.validity,\n                 record_bytes = excluded.record_bytes,\n                 updated_at = excluded.updated_at\n             WHERE excluded.sequence > head_records.sequence\n                OR (excluded.sequence = head_records.sequence\n                    AND excluded.validity > head_records.validity)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "a8e06a1e4977e330337eec26cd47414482885ce6b1811f831c83c1262d511142"
+}

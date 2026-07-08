@@ -35,23 +35,25 @@ pub(crate) fn record_matches_topic(record: &IpnsRecord, topic: &gossipsub::Topic
 /// (`StoreInserts::FilterBoth` の受理判定)。受理条件:
 /// - `IpnsRecord` としてデコードでき、署名検証に成功する(自己完結検証)
 /// - キーが payload の `name` から導出したものと一致する(他人のキーの汚染を拒否)
-/// - 既に保持しているレコードの sequence を上回る(stale put による巻き戻しを拒否)
+/// - 既に保持しているレコードを (sequence, validity) の辞書式で上回る
+///   (stale put による巻き戻しを拒否しつつ、sequence を変えず validity のみ
+///   更新する republish は受理する。networking.md §4.2)
 /// 受理時は validity から失効時刻を再計算したレコードを返す
 /// (送信者申告の expires を信用しない)。
 pub(crate) fn validate_inbound_head_record(
     record: &kad::Record,
-    existing_seq: Option<u64>,
+    existing: Option<(u64, i64)>,
 ) -> Result<kad::Record, String> {
     let decoded = record_from_bytes(&record.value).map_err(|e| format!("undecodable: {e}"))?;
     verify_ipns_record(&decoded).map_err(|_| "invalid signature".to_string())?;
     if record.key != head_record_key(decoded.payload.name.as_ref()) {
         return Err("key does not match record name".to_string());
     }
-    if let Some(known) = existing_seq {
-        if decoded.payload.sequence <= known {
+    if let Some((known_seq, known_validity)) = existing {
+        if (decoded.payload.sequence, decoded.payload.validity) <= (known_seq, known_validity) {
             return Err(format!(
-                "stale sequence {} (known {known})",
-                decoded.payload.sequence
+                "stale record (sequence {}, validity {}) (known: sequence {known_seq}, validity {known_validity})",
+                decoded.payload.sequence, decoded.payload.validity
             ));
         }
     }
@@ -95,7 +97,8 @@ mod tests {
     fn inbound_record_validation_rules() {
         let id = Identity::generate();
         let pubkey = id.public_key_bytes();
-        let record = make_record(&id, 5, far_future_ms());
+        let validity = far_future_ms();
+        let record = make_record(&id, 5, validity);
         let kad_record = kad::Record {
             key: head_record_key(&pubkey),
             value: record_to_bytes(&record),
@@ -107,10 +110,15 @@ mod tests {
         let accepted = validate_inbound_head_record(&kad_record, None).unwrap();
         assert!(accepted.expires.is_some());
 
-        // 既知 seq を上回れば受理、同じ・下回るは stale として拒否
-        assert!(validate_inbound_head_record(&kad_record, Some(4)).is_ok());
-        assert!(validate_inbound_head_record(&kad_record, Some(5)).is_err());
-        assert!(validate_inbound_head_record(&kad_record, Some(6)).is_err());
+        // (sequence, validity) の辞書式で既知を上回れば受理、同じ・下回るは stale として拒否
+        assert!(validate_inbound_head_record(&kad_record, Some((4, validity))).is_ok());
+        assert!(validate_inbound_head_record(&kad_record, Some((5, validity))).is_err());
+        assert!(validate_inbound_head_record(&kad_record, Some((6, validity))).is_err());
+
+        // republish(同一 sequence で validity のみ新しい)は受理される。
+        // validity が既知と同じ・古いものは拒否
+        assert!(validate_inbound_head_record(&kad_record, Some((5, validity - 1))).is_ok());
+        assert!(validate_inbound_head_record(&kad_record, Some((5, validity + 1))).is_err());
 
         // 改ざんレコード(署名不一致)は拒否
         let mut tampered = record.clone();

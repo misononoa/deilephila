@@ -72,6 +72,7 @@ pub async fn handle_head_record(
         .upsert_head_record(
             &author_hex,
             record.payload.sequence,
+            record.payload.validity,
             &record_to_bytes(record),
             now_ms(),
         )

@@ -113,6 +113,7 @@ headポインタは新規イベント(投稿・編集・削除・プロフィー
 
 - レコードはイベントと同じ canonical DAG-CBOR でシリアライズし、署名対象は payload のシリアライズ済みバイト列とする(IPNS 仕様の protobuf 形式は不採用。経緯は [mvp.md](mvp.md) §4 R1)。
 - `validity` は Unix epoch ミリ秒の絶対時刻。現在時刻が `validity` 以上なら失効(EOL)とみなす。失効済みレコードも署名と `sequence` は検証可能であり、head 解決の候補としては有効([networking.md](networking.md) §4.3)。
+- 同一 `sequence` の候補が複数あるときは `validity` が最大のものを採用する(head 解決の比較キーは (sequence, validity) の辞書式、[networking.md](networking.md) §4)。republish は `sequence` を変えず validity のみ更新した再発行であるため。
 - `display_name` は未設定のとき空文字列とする(SQLite projection と同じ規約)。
 
 ## 3. プロフィール

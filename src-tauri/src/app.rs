@@ -122,6 +122,7 @@ async fn store_and_publish_head_record(
         .upsert_head_record(
             &pubkey_hex,
             record.payload.sequence,
+            record.payload.validity,
             &record_to_bytes(&record),
             now_ms(),
         )

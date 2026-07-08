@@ -363,6 +363,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn republish_updates_validity_on_remote_node() {
+        // republish = 同一 sequence で validity のみ更新したレコードの再発行。
+        // 既に旧レコードを保持するノード経由の解決が、(sequence, validity) の
+        // 辞書式比較(格納前検証 + argmax)で新 validity に収束することの検証
+        let store_a = Arc::new(Store::open_in_memory().await.unwrap());
+        let (handle_a, _events_a, _addr_a) = spawn_test_node(store_a).await;
+        let store_b = Arc::new(Store::open_in_memory().await.unwrap());
+        let (handle_b, mut events_b, addr_b) = spawn_test_node(store_b).await;
+
+        handle_a.dial(addr_b).await;
+        wait_peer_connected_ev(&mut events_b).await;
+
+        let id = Identity::generate();
+        let v1 = far_future_ms();
+        handle_a.publish_head(make_record(&id, 5, v1)).await;
+        let resolved = resolve_with_retry(&handle_b, id.public_key_bytes())
+            .await
+            .expect("initial record not resolvable");
+        assert_eq!(resolved.payload.validity, v1);
+
+        // validity を延長して republish(sequence は据え置き)
+        let v2 = v1 + 3_600_000;
+        handle_a.publish_head(make_record(&id, 5, v2)).await;
+
+        let mut updated = None;
+        for _ in 0..40 {
+            if let Some(r) = handle_b.resolve_ipns(id.public_key_bytes()).await {
+                if r.payload.validity == v2 {
+                    updated = Some(r);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let updated = updated.expect("republished record did not propagate");
+        assert_eq!(updated.payload.sequence, 5);
+        assert!(verify_ipns_record(&updated).is_ok());
+    }
+
+    #[tokio::test]
     async fn invalid_record_not_resolvable() {
         let store_a = Arc::new(Store::open_in_memory().await.unwrap());
         let (handle_a, _events_a, addr_a) = spawn_test_node(store_a).await;
