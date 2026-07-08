@@ -14,7 +14,8 @@ use common::TestApp;
 use deilephila_lib::app::{self, AppState, Notifier, UiEvent};
 use deilephila_lib::head::feed_topic_str;
 use deilephila_lib::network::NetworkHandle;
-use deilephila_lib::store::{hex_to_pubkey, Store};
+use deilephila_lib::store::Store;
+use deilephila_lib::util::hex_to_pubkey;
 use tokio::sync::mpsc;
 
 /// 投稿間で timestamp(ミリ秒)を確実に単調増加させる。
@@ -264,7 +265,6 @@ async fn command_error_paths() {
     assert!(!status.setup && !status.unlocked);
     assert!(app::create_post(&state, "x".into()).await.is_err());
     assert!(app::get_timeline(&state).await.is_err());
-    assert!(app::get_my_posts(&state).await.is_err());
     assert!(app::follow_user(&state, "ab".repeat(32)).await.is_err());
     assert!(app::unlock_account(&state, "pass".into()).await.is_err());
 

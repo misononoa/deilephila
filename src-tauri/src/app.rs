@@ -18,8 +18,9 @@ use crate::head::{create_ipns_record, record_to_bytes, IpnsRecord, RECORD_LIFETI
 use crate::identity::{create_envelope, Identity};
 use crate::keystore::Keystore;
 use crate::network::{NetworkEvent, NetworkHandle};
-use crate::store::{bytes_to_hex, hex_to_pubkey, PostRow, Store, TimelineRow};
+use crate::store::{Store, TimelineRow};
 use crate::sync::SyncOutcome;
+use crate::util::{bytes_to_hex, hex_to_pubkey, now_ms};
 
 // --- ヘルパー ---
 
@@ -31,13 +32,6 @@ impl<T, E: ToString> ToCommandResult<T> for Result<T, E> {
     fn cmd(self) -> Result<T, String> {
         self.map_err(|e| e.to_string())
     }
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before epoch")
-        .as_millis() as i64
 }
 
 /// 公開鍵 hex の正規化と検証(64桁の16進、小文字化)。
@@ -180,20 +174,6 @@ pub struct PostView {
     pub deleted: bool,
     /// author の表示名(accounts に Profile が fold 済みなら Some)
     pub author_display_name: Option<String>,
-}
-
-impl From<PostRow> for PostView {
-    fn from(r: PostRow) -> Self {
-        PostView {
-            cid: r.cid,
-            author: r.author,
-            text: r.text,
-            timestamp: r.timestamp,
-            edited: r.edited,
-            deleted: r.deleted,
-            author_display_name: None,
-        }
-    }
 }
 
 impl From<TimelineRow> for PostView {
@@ -507,35 +487,4 @@ pub async fn get_timeline(state: &AppState) -> Result<Vec<PostView>, String> {
 
     let rows = state.store.get_timeline(&pubkey_hex).await.cmd()?;
     Ok(rows.into_iter().map(PostView::from).collect())
-}
-
-/// CID 文字列でブロックを取得する。ローカルになければネットワークから取得を試みる。
-/// M3 デバッグ用。M4 以降で本格利用。
-pub async fn get_block(state: &AppState, cid: String) -> Result<Vec<u8>, String> {
-    let parsed: Cid = cid.parse().map_err(|e| format!("invalid CID: {e}"))?;
-
-    // まずローカルを確認
-    if let Some(data) = state.store.get_raw_block(&cid).await.cmd()? {
-        return Ok(data);
-    }
-
-    // ローカルになければネットワークから取得
-    state
-        .network
-        .get_block(parsed, None)
-        .await
-        .ok_or_else(|| "block not found".to_string())
-}
-
-/// 自分の投稿一覧を返す(削除済みを含む。UI 側でフィルタ)。
-pub async fn get_my_posts(state: &AppState) -> Result<Vec<PostView>, String> {
-    let pubkey_hex = {
-        let guard = state.account.lock().await;
-        let account = guard.as_ref().ok_or("account not unlocked")?;
-        bytes_to_hex(&account.identity.public_key_bytes())
-    };
-
-    let posts = state.store.get_posts_by_author(&pubkey_hex).await.cmd()?;
-
-    Ok(posts.into_iter().map(PostView::from).collect())
 }

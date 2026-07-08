@@ -1,5 +1,4 @@
 pub mod app;
-pub mod chain;
 pub mod commands;
 pub mod event;
 pub mod head;
@@ -8,6 +7,9 @@ pub mod keystore;
 pub mod network;
 pub mod store;
 pub mod sync;
+#[cfg(test)]
+mod testutil;
+pub mod util;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -123,8 +125,6 @@ pub fn run() {
             commands::setup_account,
             commands::unlock_account,
             commands::create_post,
-            commands::get_my_posts,
-            commands::get_block,
             commands::follow_user,
             commands::unfollow_user,
             commands::get_follows,

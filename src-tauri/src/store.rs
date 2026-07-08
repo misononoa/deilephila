@@ -3,14 +3,14 @@ use std::path::Path;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
 
-use cid::Cid;
-
 use crate::event::{envelope_cid, EventEnvelope, EventKind};
+use crate::util::{bytes_to_hex, to_dag_cbor};
 
 pub struct Store {
     pool: SqlitePool,
 }
 
+/// 単一 author の投稿行。テストが projection の検証に使う。
 #[derive(Debug, Clone)]
 pub struct PostRow {
     pub cid: String,
@@ -29,7 +29,7 @@ pub struct FollowRow {
     pub display_name: Option<String>,
 }
 
-/// タイムライン表示用の行。PostRow + author の display_name。
+/// タイムライン表示用の行。posts の行 + author の display_name。
 #[derive(Debug, Clone)]
 pub struct TimelineRow {
     pub cid: String,
@@ -50,33 +50,14 @@ pub struct AccountRow {
     pub last_seen: i64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    Sqlx(sqlx::Error),
-    Migrate(sqlx::migrate::MigrateError),
+    #[error("SQLite error: {0}")]
+    Sqlx(#[from] sqlx::Error),
+    #[error("migration error: {0}")]
+    Migrate(#[from] sqlx::migrate::MigrateError),
+    #[error("serialization error: {0}")]
     Serialization(String),
-}
-
-impl std::fmt::Display for StoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StoreError::Sqlx(e) => write!(f, "SQLite error: {e}"),
-            StoreError::Migrate(e) => write!(f, "migration error: {e}"),
-            StoreError::Serialization(s) => write!(f, "serialization error: {s}"),
-        }
-    }
-}
-
-impl From<sqlx::Error> for StoreError {
-    fn from(e: sqlx::Error) -> Self {
-        StoreError::Sqlx(e)
-    }
-}
-
-impl From<sqlx::migrate::MigrateError> for StoreError {
-    fn from(e: sqlx::migrate::MigrateError) -> Self {
-        StoreError::Migrate(e)
-    }
 }
 
 impl Store {
@@ -115,8 +96,7 @@ impl Store {
         let kind_tag = kind_tag_str(&envelope.payload.kind);
         let kind_json = serde_json::to_string(&envelope.payload.kind)
             .map_err(|e| StoreError::Serialization(e.to_string()))?;
-        let raw_cbor: Vec<u8> = serde_ipld_dagcbor::to_vec(envelope)
-            .expect("EventEnvelope DAG-CBOR serialization failed");
+        let raw_cbor: Vec<u8> = to_dag_cbor(envelope);
 
         let mut tx = self.pool.begin().await?;
 
@@ -261,20 +241,6 @@ impl Store {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(|r| r.raw_cbor))
-    }
-
-    /// 受信した生 DAG-CBOR bytes を検証して保存する(ブロック受信用)。
-    /// 検証: デシリアライズ → 署名 → CID 再計算。成功時は CID を返す。
-    pub async fn insert_raw_block(&self, data: &[u8]) -> Result<Cid, StoreError> {
-        let envelope: EventEnvelope = serde_ipld_dagcbor::from_slice(data)
-            .map_err(|e| StoreError::Serialization(e.to_string()))?;
-
-        crate::event::verify_envelope(&envelope)
-            .map_err(|e| StoreError::Serialization(format!("signature invalid: {e:?}")))?;
-
-        let cid = crate::event::envelope_cid(&envelope);
-        self.insert_event(&envelope).await?;
-        Ok(cid)
     }
 
     /// フォローを追加する。既存なら何もしない(冪等。元の since を保持)。
@@ -446,22 +412,6 @@ impl Store {
         .await?;
         Ok(row.map(|r| r.cid))
     }
-}
-
-pub fn bytes_to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-/// 64桁 hex を公開鍵バイト列へ変換する(不正な形式は None)。
-pub fn hex_to_pubkey(hex: &str) -> Option<[u8; 32]> {
-    if hex.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?;
-    }
-    Some(out)
 }
 
 fn kind_tag_str(kind: &EventKind) -> &'static str {

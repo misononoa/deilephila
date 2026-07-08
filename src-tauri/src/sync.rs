@@ -2,66 +2,37 @@ use cid::Cid;
 use libp2p::PeerId;
 use tracing::debug;
 
-use crate::event::{verify_envelope, EventEnvelope};
+use crate::event::{verify_chain_link, verify_envelope, ChainError, EventEnvelope};
 use crate::head::{record_to_bytes, verify_ipns_record, IpnsRecord};
 use crate::network::NetworkHandle;
-use crate::store::{bytes_to_hex, Store, StoreError};
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
+use crate::store::{Store, StoreError};
+use crate::util::{bytes_to_hex, now_ms};
 
 /// 1回の同期で辿るチェーン長の上限(不正な announce による暴走防止)。
 const MAX_SYNC_DEPTH: usize = 10_000;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SyncError {
+    #[error("invalid signature")]
     InvalidSignature,
+    #[error("decode error: {0}")]
     Decode(String),
     /// チェーン内のイベントの author が announce の pubkey と一致しない
-    AuthorMismatch {
-        cid: Cid,
-    },
+    #[error("author mismatch at {cid}")]
+    AuthorMismatch { cid: Cid },
     /// prev を辿った先の seq が期待値(1ずつ減少)と一致しない
-    SeqMismatch {
-        cid: Cid,
-        expected: u64,
-        got: u64,
-    },
+    #[error("seq mismatch at {cid}: expected {expected}, got {got}")]
+    SeqMismatch { cid: Cid, expected: u64, got: u64 },
     /// genesis(seq=0) に prev がある / 非 genesis に prev がない
-    BrokenChain {
-        cid: Cid,
-    },
+    #[error("broken chain at {cid}")]
+    BrokenChain { cid: Cid },
     /// ネットワークからブロックを取得できなかった
+    #[error("block unavailable: {0}")]
     BlockUnavailable(Cid),
+    #[error("chain exceeds max sync depth")]
     TooDeep,
-    Store(StoreError),
-}
-
-impl std::fmt::Display for SyncError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SyncError::InvalidSignature => write!(f, "invalid signature"),
-            SyncError::Decode(e) => write!(f, "decode error: {e}"),
-            SyncError::AuthorMismatch { cid } => write!(f, "author mismatch at {cid}"),
-            SyncError::SeqMismatch { cid, expected, got } => {
-                write!(f, "seq mismatch at {cid}: expected {expected}, got {got}")
-            }
-            SyncError::BrokenChain { cid } => write!(f, "broken chain at {cid}"),
-            SyncError::BlockUnavailable(cid) => write!(f, "block unavailable: {cid}"),
-            SyncError::TooDeep => write!(f, "chain exceeds max sync depth"),
-            SyncError::Store(e) => write!(f, "store error: {e}"),
-        }
-    }
-}
-
-impl From<StoreError> for SyncError {
-    fn from(e: StoreError) -> Self {
-        SyncError::Store(e)
-    }
+    #[error("store error: {0}")]
+    Store(#[from] StoreError),
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -140,20 +111,17 @@ pub async fn handle_head_record(
             serde_ipld_dagcbor::from_slice(&raw).map_err(|e| SyncError::Decode(e.to_string()))?;
 
         verify_envelope(&envelope).map_err(|_| SyncError::InvalidSignature)?;
-        if envelope.payload.author.as_ref() != record.payload.name.as_ref() {
-            return Err(SyncError::AuthorMismatch { cid });
-        }
-        if envelope.payload.seq != expected_seq {
-            return Err(SyncError::SeqMismatch {
-                cid,
-                expected: expected_seq,
-                got: envelope.payload.seq,
-            });
-        }
-        let is_genesis = envelope.payload.seq == 0;
-        if is_genesis != envelope.payload.prev.is_none() {
-            return Err(SyncError::BrokenChain { cid });
-        }
+        verify_chain_link(&envelope, record.payload.name.as_ref(), expected_seq).map_err(
+            |e| match e {
+                ChainError::WrongAuthor => SyncError::AuthorMismatch { cid: cid.clone() },
+                ChainError::WrongSeq { expected, got } => SyncError::SeqMismatch {
+                    cid: cid.clone(),
+                    expected,
+                    got,
+                },
+                ChainError::BrokenPrev => SyncError::BrokenChain { cid: cid.clone() },
+            },
+        )?;
 
         cursor = envelope.payload.prev.clone();
         expected_seq = expected_seq.saturating_sub(1);
@@ -178,26 +146,15 @@ pub async fn handle_head_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{bytes_to_cid, envelope_cid, EventKind};
-    use crate::head::{create_ipns_record, RECORD_LIFETIME_MS};
+    use crate::event::{envelope_cid, EventKind};
+    use crate::head::{create_ipns_record, feed_topic_str, RECORD_LIFETIME_MS};
     use crate::identity::{create_envelope, Identity};
-    use crate::network::{spawn_swarm_loop, NetworkEvent};
-    use libp2p::Multiaddr;
+    use crate::network::NetworkEvent;
+    use crate::testutil::{make_record_pointing, spawn_test_node, wait_for, wait_subscribed};
+    use crate::util::bytes_to_cid;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::mpsc;
-
-    /// テスト用の最小レコード(プロフィールスナップショットなし)。
-    fn make_record(identity: &Identity, sequence: u64, head_cid: Cid) -> IpnsRecord {
-        create_ipns_record(
-            identity,
-            sequence,
-            head_cid,
-            now_ms() + RECORD_LIFETIME_MS,
-            None,
-            String::new(),
-        )
-    }
 
     /// Post×2 + Edit の3イベントチェーンを store に入れる。
     /// Edit を含むのは「seq 昇順挿入で projection が正しく更新されること」を
@@ -244,31 +201,6 @@ mod tests {
         NetworkHandle::new(tx)
     }
 
-    async fn spawn_test_node(
-        store: Arc<Store>,
-    ) -> (NetworkHandle, mpsc::Receiver<NetworkEvent>, Multiaddr) {
-        let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
-        spawn_swarm_loop(store, Some(listen))
-            .await
-            .expect("swarm failed to start")
-    }
-
-    async fn wait_for(
-        rx: &mut mpsc::Receiver<NetworkEvent>,
-        pred: impl Fn(&NetworkEvent) -> bool,
-    ) -> NetworkEvent {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let ev = rx.recv().await.expect("event channel closed");
-                if pred(&ev) {
-                    return ev;
-                }
-            }
-        })
-        .await
-        .expect("timed out waiting for network event")
-    }
-
     #[tokio::test]
     async fn full_chain_sync_via_gossipsub() {
         // A: 3イベントのチェーンを持つ発信者
@@ -290,10 +222,7 @@ mod tests {
         handle_b.subscribe(pubkey_hex.clone()).await;
 
         // A: B の購読が伝わるのを待ってから publish(gossipsub の購読情報は接続上で交換される)
-        wait_for(&mut events_a, |e| {
-            matches!(e, NetworkEvent::PeerSubscribed { .. })
-        })
-        .await;
+        wait_subscribed(&mut events_a, &feed_topic_str(&pubkey_hex)).await;
         let record = create_ipns_record(
             &identity_a,
             head_seq,
@@ -341,7 +270,7 @@ mod tests {
     async fn tampered_record_rejected() {
         let store = Store::open_in_memory().await.unwrap();
         let id = Identity::generate();
-        let mut record = make_record(&id, 5, bytes_to_cid(b"head"));
+        let mut record = make_record_pointing(&id, 5, bytes_to_cid(b"head"));
         record.payload.sequence = 6; // 改ざん
 
         let err = handle_head_record(&store, &dummy_network(), &record, None)
@@ -362,7 +291,7 @@ mod tests {
 
         // 既知 seq 以下のレコード → ネットワークに触れず no-op
         // (dummy_network で成功すること自体が「取得を試みていない」ことの証明)
-        let record = make_record(&id, head_seq, head_cid);
+        let record = make_record_pointing(&id, head_seq, head_cid);
         let outcome = handle_head_record(&store, &dummy_network(), &record, None)
             .await
             .unwrap();
@@ -374,7 +303,7 @@ mod tests {
         let store = Store::open_in_memory().await.unwrap();
         let id = Identity::generate();
         // 署名は正しいが、指す先のブロックがどこにもないレコード
-        let record = make_record(&id, 0, bytes_to_cid(b"missing"));
+        let record = make_record_pointing(&id, 0, bytes_to_cid(b"missing"));
 
         let err = handle_head_record(&store, &dummy_network(), &record, None)
             .await

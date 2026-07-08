@@ -13,29 +13,16 @@ const NONCE_LEN: usize = 12;
 /// 最小ファイルサイズ: salt + nonce + (32バイトシード + 16バイトGCMタグ)
 const MIN_BLOB_LEN: usize = SALT_LEN + NONCE_LEN + 48;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum KeystoreError {
-    Io(std::io::Error),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("key derivation failed")]
     KeyDerivation,
+    #[error("wrong passphrase")]
     WrongPassphrase,
+    #[error("invalid keystore format")]
     InvalidFormat,
-}
-
-impl std::fmt::Display for KeystoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            KeystoreError::Io(e) => write!(f, "IO error: {e}"),
-            KeystoreError::KeyDerivation => write!(f, "key derivation failed"),
-            KeystoreError::WrongPassphrase => write!(f, "wrong passphrase"),
-            KeystoreError::InvalidFormat => write!(f, "invalid keystore format"),
-        }
-    }
-}
-
-impl From<std::io::Error> for KeystoreError {
-    fn from(e: std::io::Error) -> Self {
-        KeystoreError::Io(e)
-    }
 }
 
 pub struct Keystore {

@@ -58,13 +58,3 @@ pub async fn get_follows(state: tauri::State<'_, AppState>) -> Result<Vec<Follow
 pub async fn get_timeline(state: tauri::State<'_, AppState>) -> Result<Vec<PostView>, String> {
     app::get_timeline(state.inner()).await
 }
-
-#[tauri::command]
-pub async fn get_block(cid: String, state: tauri::State<'_, AppState>) -> Result<Vec<u8>, String> {
-    app::get_block(state.inner(), cid).await
-}
-
-#[tauri::command]
-pub async fn get_my_posts(state: tauri::State<'_, AppState>) -> Result<Vec<PostView>, String> {
-    app::get_my_posts(state.inner()).await
-}
