@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT pubkey FROM follows WHERE pubkey = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "pubkey",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0a8609ff9e50574f6f5b802e87a8113c2f7f54b590198dc1b6009ec99adc4dd2"
+}

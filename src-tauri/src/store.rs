@@ -271,6 +271,14 @@ impl Store {
         Ok(())
     }
 
+    /// 指定した公開鍵をフォローしているかを返す(受信レコードの受理判定用)。
+    pub async fn is_followed(&self, pubkey_hex: &str) -> Result<bool, StoreError> {
+        let row = sqlx::query!("SELECT pubkey FROM follows WHERE pubkey = ?", pubkey_hex)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
+    }
+
     /// フォロー一覧を返す(新しい順)。display_name は accounts にあれば同梱。
     pub async fn get_follows(&self) -> Result<Vec<FollowRow>, StoreError> {
         let rows = sqlx::query!(

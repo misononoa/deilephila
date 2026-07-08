@@ -3,9 +3,9 @@
 
 use std::time::{Duration, Instant};
 
-use libp2p::kad;
+use libp2p::{gossipsub, kad};
 
-use crate::head::{record_from_bytes, verify_ipns_record};
+use crate::head::{feed_topic_str, record_from_bytes, verify_ipns_record, IpnsRecord};
 use crate::util::{bytes_to_hex, now_ms};
 
 /// アカウント公開鍵から DHT レコードキーを導出する。
@@ -20,6 +20,15 @@ pub(crate) fn head_record_key(pubkey: &[u8; 32]) -> kad::RecordKey {
 pub(crate) fn expires_from_validity(validity_ms: i64) -> Option<Instant> {
     let ttl_ms = validity_ms.saturating_sub(now_ms()).max(0) as u64;
     Some(Instant::now() + Duration::from_millis(ttl_ms))
+}
+
+/// gossipsub で届いたレコードが、届いたトピックの持ち主のものかを判定する
+/// (networking.md §4.1: topic `deilephila/feed/<pubkey>` にはその pubkey の
+/// レコードだけが流れる)。不一致は、フォロー相手のトピックに別アカウントの
+/// レコードを流し込む攻撃(フォロー外チェーンの取り込み誘導)なので破棄する。
+pub(crate) fn record_matches_topic(record: &IpnsRecord, topic: &gossipsub::TopicHash) -> bool {
+    let expected = feed_topic_str(&bytes_to_hex(record.payload.name.as_ref()));
+    gossipsub::IdentTopic::new(expected).hash() == *topic
 }
 
 /// 他ノードから put されたレコードを store へ格納する前に検証する
@@ -59,6 +68,28 @@ mod tests {
     use crate::head::record_to_bytes;
     use crate::identity::Identity;
     use crate::testutil::{far_future_ms, make_record};
+
+    #[test]
+    fn record_topic_match_rules() {
+        let id = Identity::generate();
+        let other = Identity::generate();
+        let record = make_record(&id, 1, far_future_ms());
+
+        let own_topic = gossipsub::IdentTopic::new(crate::head::feed_topic_str(&bytes_to_hex(
+            &id.public_key_bytes(),
+        )))
+        .hash();
+        let other_topic = gossipsub::IdentTopic::new(crate::head::feed_topic_str(&bytes_to_hex(
+            &other.public_key_bytes(),
+        )))
+        .hash();
+        let unrelated_topic = gossipsub::IdentTopic::new("deilephila/unrelated").hash();
+
+        assert!(record_matches_topic(&record, &own_topic));
+        // 別アカウントのトピックへの流し込みは不一致
+        assert!(!record_matches_topic(&record, &other_topic));
+        assert!(!record_matches_topic(&record, &unrelated_topic));
+    }
 
     #[test]
     fn inbound_record_validation_rules() {

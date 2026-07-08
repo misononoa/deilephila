@@ -236,6 +236,38 @@ impl AppState {
 
 // --- NetworkEvent 消費ループ ---
 
+/// gossipsub 由来の IPNS-headレコード1件を処理する。フォロー相手のものだけ
+/// チェーン同期に流し(networking.md §6: フォローしていないユーザーのデータは
+/// 原則受け取らない)、新規イベントを取り込んだら `TimelineUpdated` を通知する。
+/// 自分のレコードがこの経路に来ることはない(自分のトピックは購読しない)。
+pub async fn handle_head_received(
+    store: &Store,
+    network: &NetworkHandle,
+    record: &IpnsRecord,
+    source: PeerId,
+    notify: &Notifier,
+) {
+    let author_hex = bytes_to_hex(record.payload.name.as_ref());
+    match store.is_followed(&author_hex).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::debug!("ignoring head record for unfollowed account {author_hex}");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("follow lookup failed for {author_hex}: {e}");
+            return;
+        }
+    }
+    match crate::sync::handle_head_record(store, network, record, Some(source)).await {
+        Ok(outcome) if outcome.new_events > 0 => {
+            notify.notify(UiEvent::TimelineUpdated);
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("chain sync failed: {e}"),
+    }
+}
+
 /// NetworkEvent を消費する core タスクの本体。IPNS-headレコードが届いたら
 /// チェーン同期を実行し、新規イベントを取り込んだら `TimelineUpdated` を通知する。
 /// 呼び出し側(lib.rs / テストハーネス)が spawn する。
@@ -248,15 +280,7 @@ pub async fn network_consumer_loop(
     while let Some(event) = event_rx.recv().await {
         match event {
             NetworkEvent::HeadReceived { record, source } => {
-                match crate::sync::handle_head_record(&store, &network, &record, Some(source))
-                    .await
-                {
-                    Ok(outcome) if outcome.new_events > 0 => {
-                        notify.notify(UiEvent::TimelineUpdated);
-                    }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!("chain sync failed: {e}"),
-                }
+                handle_head_received(&store, &network, &record, source, &notify).await;
             }
             NetworkEvent::PeerConnected(peer) => notify.notify(UiEvent::PeerConnected(peer)),
             NetworkEvent::PeerSubscribed { peer, topic } => {
@@ -487,4 +511,56 @@ pub async fn get_timeline(state: &AppState) -> Result<Vec<PostView>, String> {
 
     let rows = state.store.get_timeline(&pubkey_hex).await.cmd()?;
     Ok(rows.into_iter().map(PostView::from).collect())
+}
+
+// --- テスト ---
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{far_future_ms, make_record};
+
+    /// コマンド受信側を持たない NetworkHandle(ネットワーク不要のテスト用)。
+    fn dummy_network() -> NetworkHandle {
+        let (tx, _rx) = mpsc::channel(1);
+        NetworkHandle::new(tx)
+    }
+
+    fn dummy_source() -> PeerId {
+        PeerId::random()
+    }
+
+    #[tokio::test]
+    async fn record_from_unfollowed_author_ignored() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (notify, _ui) = Notifier::channel();
+        let stranger = Identity::generate();
+        let record = make_record(&stranger, 1, far_future_ms());
+
+        handle_head_received(&store, &dummy_network(), &record, dummy_source(), &notify).await;
+
+        // フォロー外のレコードは同期に流れず、何も保存されない
+        let author_hex = bytes_to_hex(&stranger.public_key_bytes());
+        assert!(store.get_head_record(&author_hex).await.unwrap().is_none());
+        assert!(store.get_account(&author_hex).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn record_from_followed_author_processed() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (notify, _ui) = Notifier::channel();
+        let followee = Identity::generate();
+        let author_hex = bytes_to_hex(&followee.public_key_bytes());
+        let record = make_record(&followee, 1, far_future_ms());
+
+        store.add_follow(&author_hex, now_ms()).await.unwrap();
+        handle_head_received(&store, &dummy_network(), &record, dummy_source(), &notify).await;
+
+        // 同期に流れてレコードが保持される(ブロック取得は dummy_network で
+        // 失敗するが、ポインタと表示名スナップショットは残る = 可用性の床)
+        let (seq, _) = store.get_head_record(&author_hex).await.unwrap().unwrap();
+        assert_eq!(seq, 1);
+        let account = store.get_account(&author_hex).await.unwrap().unwrap();
+        assert_eq!(account.display_name, "Alice");
+    }
 }

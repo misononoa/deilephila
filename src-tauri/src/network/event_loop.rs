@@ -18,7 +18,10 @@ use tracing::{debug, info, warn};
 use crate::{
     head::{feed_topic_str, record_from_bytes, record_to_bytes, IpnsRecord},
     network::behaviour::{build_swarm, DeilephilaBehaviour, DeilephilaBehaviourEvent},
-    network::ipns::{expires_from_validity, head_record_key, validate_inbound_head_record},
+    network::ipns::{
+        expires_from_validity, head_record_key, record_matches_topic,
+        validate_inbound_head_record,
+    },
     network::protocol::{BlockResponse, WantBlock},
     network::{NetworkCommand, NetworkEvent},
     store::Store,
@@ -192,6 +195,18 @@ pub(crate) async fn run_swarm_loop(
                         ..
                     } => match record_from_bytes(&message.data) {
                         Ok(record) => {
+                            // トピックとレコード name の整合を検証する。不一致は
+                            // フォロー相手のトピックに別アカウントのレコードを
+                            // 流し込む攻撃なので破棄する(networking.md §4.1)
+                            if !record_matches_topic(&record, &message.topic) {
+                                warn!(
+                                    "record/topic mismatch from {propagation_source}: \
+                                     record for {} on topic {}",
+                                    bytes_to_hex(record.payload.name.as_ref()),
+                                    message.topic
+                                );
+                                continue;
+                            }
                             // source は転送元(直接接続中のピア)。レコードの真正性は
                             // payload 内の署名で別途検証されるため、ここでは検証しない
                             let _ = event_tx.try_send(NetworkEvent::HeadReceived {
