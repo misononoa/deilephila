@@ -40,6 +40,8 @@ struct DeilephilaBehaviour {
 
 ブロック交換は `request_response` のカスタムプロトコル + 自前ブロックストア(SQLite)で実装する。ブロックは DAG-CBOR、CID は sha2-256 multihash + dag-cbor codec。本アプリは公開 IPFS との相互運用を必要としないため bitswap 互換は不要。IPLD・IPNS・DHT・gossipsub はブロック交換の transport プロトコルと独立しているため、この層の実装を差し替えても他層に影響しない。
 
+ワイヤ形式は u32(ビッグエンディアン)長プレフィックス付きバイト列。受信側は申告長がリクエスト(CID bytes)256B・レスポンス(ブロック本体)1MiB の上限を超える場合、バッファを確保せず `InvalidData` として即拒否する(悪意あるピアによるメモリ DoS の防止)。
+
 ### 3.2 ブロックのライフサイクル(複製・保持)
 
 複製範囲・保持期間はクライアントが任意設定できる([mvp.md](mvp.md) §4 R2)。デフォルトは以下。

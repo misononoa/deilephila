@@ -27,6 +27,11 @@ pub enum BlockResponse {
     NotFound,
 }
 
+/// リクエスト(CID bytes)の長さ上限。CID は実際には数十バイト。
+const MAX_REQUEST_LEN: u32 = 256;
+/// レスポンス(ブロック本体)の長さ上限。イベント 1 ブロックは高々数 KB。
+const MAX_RESPONSE_LEN: u32 = 1024 * 1024;
+
 /// request_response 用 codec。長さプレフィックス付きバイト列交換。
 #[derive(Debug, Clone, Default)]
 pub struct BlockExchangeCodec;
@@ -41,9 +46,7 @@ impl request_response::Codec for BlockExchangeCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let len = read_u32(io).await?;
-        let mut buf = vec![0u8; len as usize];
-        io.read_exact(&mut buf).await?;
+        let buf = read_length_prefixed(io, MAX_REQUEST_LEN).await?;
         Ok(WantBlock { cid_bytes: buf })
     }
 
@@ -59,9 +62,7 @@ impl request_response::Codec for BlockExchangeCodec {
         match tag {
             0 => Ok(BlockResponse::NotFound),
             1 => {
-                let len = read_u32(io).await?;
-                let mut buf = vec![0u8; len as usize];
-                io.read_exact(&mut buf).await?;
+                let buf = read_length_prefixed(io, MAX_RESPONSE_LEN).await?;
                 Ok(BlockResponse::Found { data: buf })
             }
             _ => Err(io::Error::new(io::ErrorKind::InvalidData, "unknown tag")),
@@ -119,10 +120,101 @@ async fn read_u32<T: AsyncRead + Unpin>(io: &mut T) -> io::Result<u32> {
     Ok(u32::from_be_bytes(buf))
 }
 
+/// u32 長プレフィックス付きバイト列を読む。申告長が `max` を超える場合は
+/// バッファを確保せず `InvalidData` で即拒否する(メモリ DoS 対策)。
+async fn read_length_prefixed<T: AsyncRead + Unpin>(io: &mut T, max: u32) -> io::Result<Vec<u8>> {
+    let len = read_u32(io).await?;
+    if len > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("length prefix {len} exceeds limit {max}"),
+        ));
+    }
+    let mut buf = vec![0u8; len as usize];
+    io.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
 async fn write_u8<T: AsyncWrite + Unpin>(io: &mut T, v: u8) -> io::Result<()> {
     io.write_all(&[v]).await
 }
 
 async fn write_u32<T: AsyncWrite + Unpin>(io: &mut T, v: u32) -> io::Result<()> {
     io.write_all(&v.to_be_bytes()).await
+}
+
+// --- テスト ---
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::io::Cursor;
+    use request_response::Codec;
+
+    #[tokio::test]
+    async fn read_request_rejects_oversized_length() {
+        let mut codec = BlockExchangeCodec;
+        let mut io = Cursor::new((MAX_REQUEST_LEN + 1).to_be_bytes().to_vec());
+        let err = codec
+            .read_request(&BlockExchangeProtocol, &mut io)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn read_response_rejects_oversized_length() {
+        let mut codec = BlockExchangeCodec;
+        let mut bytes = vec![1u8]; // Found タグ
+        bytes.extend_from_slice(&(MAX_RESPONSE_LEN + 1).to_be_bytes());
+        let mut io = Cursor::new(bytes);
+        let err = codec
+            .read_response(&BlockExchangeProtocol, &mut io)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn request_round_trip_within_limit() {
+        let mut codec = BlockExchangeCodec;
+        let req = WantBlock {
+            cid_bytes: vec![0xAB; 36],
+        };
+        let mut buf = Cursor::new(Vec::new());
+        codec
+            .write_request(&BlockExchangeProtocol, &mut buf, req.clone())
+            .await
+            .unwrap();
+        let mut io = Cursor::new(buf.into_inner());
+        let read = codec
+            .read_request(&BlockExchangeProtocol, &mut io)
+            .await
+            .unwrap();
+        assert_eq!(read.cid_bytes, req.cid_bytes);
+    }
+
+    #[tokio::test]
+    async fn response_round_trip_within_limit() {
+        let mut codec = BlockExchangeCodec;
+        let data = vec![0xCD; 4096];
+        let mut buf = Cursor::new(Vec::new());
+        codec
+            .write_response(
+                &BlockExchangeProtocol,
+                &mut buf,
+                BlockResponse::Found { data: data.clone() },
+            )
+            .await
+            .unwrap();
+        let mut io = Cursor::new(buf.into_inner());
+        match codec
+            .read_response(&BlockExchangeProtocol, &mut io)
+            .await
+            .unwrap()
+        {
+            BlockResponse::Found { data: read } => assert_eq!(read, data),
+            BlockResponse::NotFound => panic!("expected Found"),
+        }
+    }
 }
