@@ -92,20 +92,32 @@ IPNS-headレコード = { name: pubkey, value: head_cid, sequence, validity(EOL)
 
 対象が新規・オンラインのフォロワー0・IPNS失効、の三重苦が揃うと発見不能になる。これは純P2Pの還元不能な床として受容する。
 
-### 4.4 タイムライン構築アルゴリズム
+### 4.4 タイムライン構築アルゴリズム(チェーン同期)
+
+head 解決からブロック回収までの流れ。チェーン全体の一括取得ではなく、同期窓の範囲を部分的・再開可能に取得する。
 
 ```
 for 各フォロー対象 author:
     cands = collect( gossip受信, DHT(IPNS), 必要なら GetLatestHead探索 )
     rec   = argmax_(sequence, validity)( cands を署名検証でフィルタ )   // §4 argmax統一規則
-    cid   = rec.head_cid
-    while cid が未取得 かつ 必要件数に未到達:
-        block = exchange.get(cid)
+    floor = max(0, rec.sequence + 1 - 同期窓)              // 遡行下限
+    // Phase A: rec.head_cid から遡行(前方追いつき)
+    // Phase B: 取得済み区間の最下端の prev から遡行(中断からの再開)
+    for (cid, expected_seq) in 遡行:
+        取得済みブロック到達 / expected_seq < floor / 予算切れ → 停止
+        block = exchange.get(cid)   // 取得失敗 → 停止(挿入済み分は残す)
         verify(block)               // CID一致・署名・seq連続性
-        store.upsert(block)
+        チャンクへ蓄積し、チャンク単位で反転(seq 昇順)して store へ挿入
         cid = block.prev
+    sync_state へ再開カーソルと完了フラグを保存
 マージしてタイムスタンプ順に表示(SQLite の timeline クエリ、[data-model.md](data-model.md) §6)
 ```
+
+- 同期窓: author ごとに最新 N 件(既定 500)まで遡行し、それより古いイベントは取得しない。窓下限(floor)は最初の取得時に確定し、以後狭まらない。窓のサイズは複製・保持ポリシー(§3.2)と同じくクライアント設定の軸とする。
+- 部分保持と再開: 途中でブロックが取得できない場合や、予算(1回の同期で取得するイベント数の上限)を使い切った場合も、検証済みの取得分は挿入して残し、次回の announce/resolve/フォローグラフ探索の際に再開カーソルから遡行を続ける。全件取得できるまで何も取り込まない、という動作はしない。
+- 再開カーソルは書き込んだ値を正とせず、同期の終了時に「author 内最大 seq のイベントから `prev` を辿って連続到達できる区間の最下端」を検証済みイベントから導出し直して保存する。新 head への追いつきで区間が合流した場合も、中断で区間が分断した場合も、この導出により常に自己整合する。
+- 窓下限より古い区間は取得しない gap として受容する(§3.2、[mvp.md](mvp.md) §4 R2)。各イベントは単独で署名検証できるため、gap があっても整合性は損なわれない。
+- チャンク間は新しい順に挿入されるため、`Edit`/`Delete` が対象の `Post` より先に挿入されうる。projection の収束規則は [data-model.md](data-model.md) §6。
 
 ## 5. NAT越え(接続性)
 
@@ -135,5 +147,5 @@ Application Core  ◀──(mpsc: NetworkEvent)───  Swarmループ
 - `NetworkCommand`: `PublishHead`(署名付き IPNS-headレコードを gossipsub+DHT へ同時搬送), `ResolveIpns(PubKey)`(DHTから取得), `QueryLatestHead(PubKey)`(フォローグラフ探索 §4.3), `GetBlock { cid, prefer }`(prefer = ブロックを持つ見込みが高いピアを優先。NotFound や送信失敗時は残りの接続中ピアへ順に問い合わせ、全候補が尽きたら失敗を返す), `Subscribe { pubkey_hex }`, `Unsubscribe { pubkey_hex }`, `Dial(Multiaddr)`。
 - `NetworkEvent`: `HeadReceived { record, source }`(ソース問わず候補として通知。署名検証は受け手の同期処理で実施), `PeerConnected`, `PeerDiscovered`, `PeerSubscribed`。
 - 各コマンド/イベントを導入するマイルストーンは [mvp.md](mvp.md) §3 を参照。
-- 受信ブロックの永続化はネットワーク層では行わない(CID 一致の検証と転送のみ)。チェーン検証と seq 昇順での取り込みは Application Core 側の同期処理が担う([data-model.md](data-model.md) §6)。
+- 受信ブロックの永続化はネットワーク層では行わない(CID 一致の検証と転送のみ)。チェーン検証とチャンク単位の取り込み(§4.4)は Application Core 側の同期処理が担う([data-model.md](data-model.md) §6)。
 - Swarm は単一タスクが所有し、`select!` でコマンドとSwarmイベントを多重化する。同期処理は Swarm ループの外で動かす(`GetBlock` がループとの mpsc 往復を要するため、ループ内から待つとデッドロックする)。

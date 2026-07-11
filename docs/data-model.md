@@ -155,10 +155,11 @@ projection は純粋な関数(`events` の fold)なので、DBが壊れても `e
 
 | テーブル | 役割 | 主な列 |
 |-----------------|------|--------|
-| `events` | 検証済み生イベント(チェーンそのもの。検証は挿入前に実施) | cid, author, seq, prev_cid, timestamp, kind_tag, kind_json, raw_cbor(DAG-CBOR 原文 — ブロック提供と再検証の源泉) |
+| `events` | 検証済み生イベント(チェーンそのもの。検証は挿入前に実施) | cid, author, seq, prev_cid, timestamp, kind_tag, kind_json, raw_cbor(DAG-CBOR 原文 — ブロック提供と再検証の源泉), target_cid(`Edit`/`Delete`/`Reply` の対象 CID。遅延適用の索引) |
 | `posts` | `Post`+`Edit`+`Delete` を fold した表示用投稿 | cid(=生成イベント), author, seq, text(編集適用後), timestamp, edited, deleted, latest_edit_seq(last-write-wins 判定用) |
 | `accounts` | プロフィール fold 結果 + head 記録 | pubkey, display_name, bio, latest_head_cid, last_seen |
 | `head_records` | 最新 IPNS-headレコードの常時保持(自分 + フォロー相手。[networking.md](networking.md) §3.2) | pubkey, sequence, record_bytes(署名済みレコードの DAG-CBOR 原文), updated_at |
+| `sync_state` | author 別の遡行同期の進捗([networking.md](networking.md) §4.4) | pubkey, window_floor_seq(遡行下限。正典値), cursor_cid / cursor_seq(取得済み区間最下端。events から再導出できるキャッシュ), completed(遡行完了フラグ), updated_at |
 | `follows` | フォローリスト | pubkey, since |
 | `peers` | ピア情報 | peer_id, multiaddrs, last_connected |
 
@@ -168,7 +169,11 @@ projection は純粋な関数(`events` の fold)なので、DBが壊れても `e
     - `Edit`→`posts.text` 更新
     - `Delete`→`deleted` フラグ
     - `Profile`→`accounts`
-- 受信時の取り込みは seq 昇順で行う。`Edit`/`Delete` が対象の `Post` より先に来ると projection を更新できないため。
+- 受信時の取り込みはチャンク内では seq 昇順で行うが、チャンク間は新しい順になるため([networking.md](networking.md) §4.4)、`Edit`/`Delete` が対象の `Post` より先に挿入されうる。projection は次の遅延適用により、挿入順序に依存せず fold 結果へ収束する。
+    - `Edit`/`Delete` は対象 `Post` 不在でも `events` へ取り込む(projection は更新しない)。
+    - `Post` の挿入時に、`target_cid` で同一 author の既存 `Edit`(`seq` 最大)/`Delete` を引いて projection へ再適用する。
+    - 適用(直接・遅延とも)は対象 `Post` と同一 author のイベントに限る(§4)。
+- 同期窓の外(gap)にある `Post` を対象とする `Edit`/`Delete` は `events` に残るが、対象行が無いため projection には適用されない。
 
 ## 7. 正規化と署名検証
 
@@ -179,5 +184,7 @@ projection は純粋な関数(`events` の fold)なので、DBが壊れても `e
 1. CIDとブロック内容の一致(コンテンツアドレスの完全性)
 2. `author` 公開鍵で署名検証(著者性)
 3. `prev`/`seq` の連続性。
+
+`prev`/`seq` の連続性は、head からの後方遡行で期待 seq を1ずつ減らしながらリンクごとに検証する。同期を中断・再開する場合は、検証済みの再開カーソルイベントの `prev`/`seq` から期待値を引き継ぐため、再開を跨いでも検証の強度は変わらない([networking.md](networking.md) §4.4)。
 
 スパム対策の為、いずれかの検証に失敗したブロックは破棄し、ピアの評価を下げる。
