@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO sync_state\n             (pubkey, window_floor_seq, cursor_cid, cursor_seq, completed, updated_at)\n             VALUES (?, ?, ?, ?, ?, ?)\n             ON CONFLICT(pubkey) DO UPDATE SET\n                 window_floor_seq = excluded.window_floor_seq,\n                 cursor_cid       = excluded.cursor_cid,\n                 cursor_seq       = excluded.cursor_seq,\n                 completed        = excluded.completed,\n                 updated_at       = excluded.updated_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "af647a79279776a31a40aa40d5ae2cbe5026b3dd9abc6d650a2fbcee3327916d"
+}

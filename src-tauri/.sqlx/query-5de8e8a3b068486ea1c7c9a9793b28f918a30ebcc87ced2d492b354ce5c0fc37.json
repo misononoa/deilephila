@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE events SET target_cid = ? WHERE cid = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "5de8e8a3b068486ea1c7c9a9793b28f918a30ebcc87ced2d492b354ce5c0fc37"
+}

@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT seq, raw_cbor FROM events\n         WHERE target_cid = ? AND author = ? AND kind_tag = 'Edit'\n         ORDER BY seq DESC LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "seq",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "raw_cbor",
+        "ordinal": 1,
+        "type_info": "Blob"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "2ecca69b7b5e52103529454eef22dd4d99af30e53772ca7f95d500c3bdf32b79"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE posts SET deleted = 1\n         WHERE cid = ?\n           AND EXISTS (SELECT 1 FROM events\n                       WHERE target_cid = ? AND author = ? AND kind_tag = 'Delete')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "1ef148513b473b5e677c1d4ffd0b48e041baf70ca6086f11c0aec3dcb45a05fb"
+}
