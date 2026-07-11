@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE events SET target_cid = NULL WHERE kind_tag = 'Edit'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "2c9600ab7ac645ddd6443c8d8881e94d11a01cba49178ca72ee2d623c94d8064"
+}

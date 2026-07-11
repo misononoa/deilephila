@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT COUNT(*) AS n FROM events WHERE kind_tag = 'Edit' AND target_cid IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "name": "n",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "49534b26e5b496221cb854f4cc9ea61d12d6ff8cf0f75fb3963bcdff73243f0a"
+}
