@@ -370,10 +370,16 @@ impl Store {
         Ok(rows)
     }
 
+    /// アカウントを取得する。`display_name` は表示解決済みの値(チェーンの
+    /// Profile fold = Tier 1 があればそれ、なければ IPNS-headレコードの
+    /// スナップショット = Tier 0、どちらも無ければ空文字列。[data-model.md] §3)。
     pub async fn get_account(&self, pubkey_hex: &str) -> Result<Option<AccountRow>, StoreError> {
         let row = sqlx::query!(
-            "SELECT pubkey, display_name, bio, latest_head_cid, last_seen
-             FROM accounts WHERE pubkey = ?",
+            r#"SELECT pubkey,
+               COALESCE(NULLIF(display_name, ''), NULLIF(snapshot_display_name, ''), '')
+                   AS "display_name!: String",
+               bio, latest_head_cid, last_seen
+             FROM accounts WHERE pubkey = ?"#,
             pubkey_hex
         )
         .fetch_optional(&self.pool)
@@ -442,11 +448,14 @@ impl Store {
         Ok(row.is_some())
     }
 
-    /// フォロー一覧を返す(新しい順)。display_name は accounts にあれば同梱。
+    /// フォロー一覧を返す(新しい順)。display_name は accounts にあれば同梱
+    /// (Tier 1 のチェーン fold を優先し、無ければ Tier 0 のスナップショット。
+    /// [data-model.md] §3)。
     pub async fn get_follows(&self) -> Result<Vec<FollowRow>, StoreError> {
         let rows = sqlx::query!(
             r#"SELECT f.pubkey, f.since,
-               NULLIF(a.display_name, '') AS "display_name?: String"
+               COALESCE(NULLIF(a.display_name, ''), NULLIF(a.snapshot_display_name, ''))
+                   AS "display_name?: String"
                FROM follows f
                LEFT JOIN accounts a ON a.pubkey = f.pubkey
                ORDER BY f.since DESC"#
@@ -473,7 +482,8 @@ impl Store {
             r#"SELECT p.cid, p.author, p.text, p.timestamp,
                p.edited AS "edited: bool",
                p.deleted AS "deleted: bool",
-               NULLIF(a.display_name, '') AS "display_name?: String"
+               COALESCE(NULLIF(a.display_name, ''), NULLIF(a.snapshot_display_name, ''))
+                   AS "display_name?: String"
                FROM posts p
                LEFT JOIN accounts a ON a.pubkey = p.author
                WHERE p.author = ? OR p.author IN (SELECT pubkey FROM follows)
@@ -608,20 +618,30 @@ impl Store {
         Ok(row.map(|r| (r.sequence as u64, r.record_bytes)))
     }
 
-    /// IPNS-headレコードの display_name スナップショット(Tier 0)を accounts に
-    /// 反映する。チェーンの Profile fold が正典なので、未設定(空)のときだけ埋める
-    /// ([data-model.md] §3: 不一致時はチェーンが勝つ)。
+    /// IPNS-headレコードの display_name スナップショット(Tier 0)を
+    /// `accounts.snapshot_display_name` に反映する。チェーンの Profile fold
+    /// (`accounts.display_name`, Tier 1)とは別列で、出所を混同しない
+    /// ([data-model.md] §3)。同梱元レコードの `sequence` がこれまでの
+    /// スナップショットより新しいときだけ上書きする(古いレコードでの
+    /// 巻き戻しを防ぐ)。表示解決(fold 優先、なければスナップショット)は
+    /// 読み出し側([get_account]・[Store::get_follows]・[Store::get_timeline])の責務。
     pub async fn fill_display_name_snapshot(
         &self,
         pubkey_hex: &str,
+        sequence: u64,
         display_name: &str,
     ) -> Result<(), StoreError> {
+        let seq = sequence as i64;
         sqlx::query!(
-            "INSERT INTO accounts (pubkey, display_name) VALUES (?, ?)
-             ON CONFLICT(pubkey) DO UPDATE SET display_name = excluded.display_name
-             WHERE accounts.display_name = ''",
+            "INSERT INTO accounts (pubkey, snapshot_display_name, snapshot_seq)
+             VALUES (?, ?, ?)
+             ON CONFLICT(pubkey) DO UPDATE SET
+                 snapshot_display_name = excluded.snapshot_display_name,
+                 snapshot_seq = excluded.snapshot_seq
+             WHERE excluded.snapshot_seq > accounts.snapshot_seq",
             pubkey_hex,
-            display_name
+            display_name,
+            seq
         )
         .execute(&self.pool)
         .await?;
@@ -1254,6 +1274,72 @@ mod tests {
 
         let follows = store.get_follows().await.unwrap();
         assert_eq!(follows[0].display_name.as_deref(), Some("Bob"));
+    }
+
+    #[tokio::test]
+    async fn display_name_snapshot_updates_on_newer_sequence() {
+        // issue #8: 一度書かれたスナップショットが改名後の新しいレコードで
+        // 更新されることを検証する(旧実装は WHERE display_name = '' ガードで
+        // 二度と更新されなかった)
+        let store = make_store().await;
+        let pubkey_hex = "aa11";
+
+        store
+            .fill_display_name_snapshot(pubkey_hex, 3, "Alice")
+            .await
+            .unwrap();
+        let account = store.get_account(pubkey_hex).await.unwrap().unwrap();
+        assert_eq!(account.display_name, "Alice");
+
+        // より新しい sequence の改名レコード → 上書きされる
+        store
+            .fill_display_name_snapshot(pubkey_hex, 4, "Alice2")
+            .await
+            .unwrap();
+        let account = store.get_account(pubkey_hex).await.unwrap().unwrap();
+        assert_eq!(account.display_name, "Alice2");
+
+        // 既知より古い/同じ sequence のレコード → 巻き戻されない
+        store
+            .fill_display_name_snapshot(pubkey_hex, 4, "Mallory")
+            .await
+            .unwrap();
+        store
+            .fill_display_name_snapshot(pubkey_hex, 2, "Mallory")
+            .await
+            .unwrap();
+        let account = store.get_account(pubkey_hex).await.unwrap().unwrap();
+        assert_eq!(account.display_name, "Alice2");
+    }
+
+    #[tokio::test]
+    async fn display_name_snapshot_never_overrides_chain_fold() {
+        // 不一致時はチェーンが勝つ(data-model.md §3): Tier 1(Profile fold)が
+        // あれば、より新しい sequence の Tier 0 スナップショットが来ても
+        // 表示上はチェーン側の値を優先する
+        let store = make_store().await;
+        let identity = Identity::generate();
+        let pubkey_hex = bytes_to_hex(&identity.public_key_bytes());
+
+        let profile = create_envelope(
+            &identity,
+            0,
+            None,
+            EventKind::Profile {
+                display_name: "ChainName".to_string(),
+                bio: String::new(),
+                avatar_cid: None,
+            },
+        );
+        store.insert_event(&profile).await.unwrap();
+
+        store
+            .fill_display_name_snapshot(&pubkey_hex, 99, "SnapshotName")
+            .await
+            .unwrap();
+
+        let account = store.get_account(&pubkey_hex).await.unwrap().unwrap();
+        assert_eq!(account.display_name, "ChainName");
     }
 
     #[tokio::test]

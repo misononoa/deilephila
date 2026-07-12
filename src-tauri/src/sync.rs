@@ -141,11 +141,15 @@ pub(crate) async fn handle_head_record_with_limits(
         .upsert_head_record(record, now_ms())
         .await?
         .forks_recorded;
-    if !record.payload.display_name.is_empty() {
-        store
-            .fill_display_name_snapshot(&author_hex, &record.payload.display_name)
-            .await?;
-    }
+    // sequence 比較で新旧判定するため、空文字列(未設定)への遷移も含めて常に反映する
+    // (store 側の WHERE ガードが古いレコードによる巻き戻しを防ぐ。issue #8)
+    store
+        .fill_display_name_snapshot(
+            &author_hex,
+            record.payload.sequence,
+            &record.payload.display_name,
+        )
+        .await?;
 
     // 窓下限の決定。1件でも取得済みなら凍結(窓が後から狭まらない)、
     // 未取得なら最新 head を基準に「最新 window 件」へ引き上げる
@@ -368,7 +372,9 @@ mod tests {
     use crate::head::{create_ipns_record, feed_topic_str, RECORD_LIFETIME_MS};
     use crate::identity::{create_envelope, Identity};
     use crate::network::NetworkEvent;
-    use crate::testutil::{make_record_pointing, spawn_test_node, wait_for, wait_subscribed};
+    use crate::testutil::{
+        far_future_ms, make_record_pointing, spawn_test_node, wait_for, wait_subscribed,
+    };
     use crate::util::bytes_to_cid;
     use std::sync::Arc;
     use std::time::Duration;
@@ -548,6 +554,60 @@ mod tests {
         // 全損時は head を確定しない
         let account = store.get_account(&author_hex).await.unwrap();
         assert!(account.is_none_or(|a| a.latest_head_cid.is_none()));
+    }
+
+    /// issue #8 の回帰テスト: チェーン本体(Profile イベント)を取得できない
+    /// フォロワー(ブロック取得失敗が続く状況)でも、相手の改名後に届く
+    /// 新しい sequence のレコードで表示名スナップショットが更新されること。
+    #[tokio::test]
+    async fn display_name_snapshot_updates_across_records() {
+        let store = Store::open_in_memory().await.unwrap();
+        let id = Identity::generate();
+        let author_hex = bytes_to_hex(&id.public_key_bytes());
+
+        let record = create_ipns_record(
+            &id,
+            0,
+            bytes_to_cid(b"missing"),
+            far_future_ms(),
+            None,
+            "Alice".to_string(),
+        );
+        handle_head_record(&store, &dummy_network(), &record, None)
+            .await
+            .unwrap();
+        let account = store.get_account(&author_hex).await.unwrap().unwrap();
+        assert_eq!(account.display_name, "Alice");
+
+        // 改名: より新しい sequence のレコード → 反映される
+        let renamed = create_ipns_record(
+            &id,
+            1,
+            bytes_to_cid(b"missing"),
+            far_future_ms(),
+            None,
+            "Alice2".to_string(),
+        );
+        handle_head_record(&store, &dummy_network(), &renamed, None)
+            .await
+            .unwrap();
+        let account = store.get_account(&author_hex).await.unwrap().unwrap();
+        assert_eq!(account.display_name, "Alice2");
+
+        // republish 等で古い sequence のレコードが後から届いても巻き戻らない
+        let stale = create_ipns_record(
+            &id,
+            0,
+            bytes_to_cid(b"missing"),
+            far_future_ms(),
+            None,
+            "Mallory".to_string(),
+        );
+        handle_head_record(&store, &dummy_network(), &stale, None)
+            .await
+            .unwrap();
+        let account = store.get_account(&author_hex).await.unwrap().unwrap();
+        assert_eq!(account.display_name, "Alice2");
     }
 
     /// M5c の中核シナリオ: gossipsub を購読していない後発フォロワーが、
