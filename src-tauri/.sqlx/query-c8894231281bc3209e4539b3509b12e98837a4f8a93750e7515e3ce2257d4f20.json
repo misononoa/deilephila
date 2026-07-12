@@ -1,0 +1,44 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT pubkey, window_floor_seq, cursor_cid, cursor_seq,\n             completed AS \"completed: bool\"\n             FROM sync_state WHERE pubkey = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "pubkey",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "window_floor_seq",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "cursor_cid",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "cursor_seq",
+        "ordinal": 3,
+        "type_info": "Integer"
+      },
+      {
+        "name": "completed: bool",
+        "ordinal": 4,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "c8894231281bc3209e4539b3509b12e98837a4f8a93750e7515e3ce2257d4f20"
+}

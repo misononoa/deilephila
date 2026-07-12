@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT raw_cbor FROM events\n             WHERE kind_tag IN ('Edit', 'Delete', 'Reply') AND target_cid IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "name": "raw_cbor",
+        "ordinal": 0,
+        "type_info": "Blob"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7b850c9250ff74d50a5a9b206f6d1747ff4502098f4fbee64b706de2a22e071f"
+}

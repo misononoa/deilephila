@@ -58,6 +58,7 @@ deilephila の設計・実装で用いる用語を定義し、表記と文書の
 | head | `head_cid` | チェーン最新イベントの CID。唯一の可変ポインタ。 | [networking.md](networking.md) §4 |
 | fold | — | イベント列を畳み込んで現在状態(投稿一覧・プロフィール・フォロー)を導く操作。 | [data-model.md](data-model.md) §2 |
 | projection | — | `fold` 結果を SQLite に投影したキャッシュ。正典ではなく再構築可能。 | [data-model.md](data-model.md) §6 |
+| 遅延適用 | — | `Post` 挿入時に、先に到着していた同一 author の `Edit`/`Delete` を projection へ再適用する規則。挿入順序に依存しない収束を保証。 | [data-model.md](data-model.md) §6 |
 | 正典 | source of truth | 最終的な真実の所在。deilephila ではチェーン(SQLiteは projection)。 | [data-model.md](data-model.md) §6 |
 
 ## 4. ネットワーク
@@ -78,4 +79,7 @@ deilephila の設計・実装で用いる用語を定義し、表記と文書の
 | NAT越え | autonat / dcutr / relay | 到達性判定・hole punching・リレーの総称。 | [networking.md](networking.md) §5 |
 | peer scoring | — | gossipsub のピア評価。検証失敗ピアをメッシュから除外。 | [networking.md](networking.md) §6 |
 | タイムライン | — | フォロー集合の投稿を時系列にマージした表示。 | [networking.md](networking.md) §4.4 |
+| 同期窓 | sync window | チェーン遡行の取得範囲。author ごとに最新 N 件(既定 500)まで遡行し、それより古い側は取得しない。 | [networking.md](networking.md) §4.4 |
+| 再開カーソル | `sync_state` | 遡行同期の進捗。取得済み区間の最下端で、`events` から再導出できる。中断した同期は次回ここから再開する。 | [networking.md](networking.md) §4.4 |
+| gap | ギャップ | チェーン中の未取得区間。同期窓の打ち切りや部分保持で生じる。可用性の問題であり、整合性(署名・CID検証)には影響しない。 | [mvp.md](mvp.md) §4 R2 |
 | multiaddr | — | ピアの到達アドレス表現(libp2p)。 | [networking.md](networking.md) §2 |

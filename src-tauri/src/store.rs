@@ -4,7 +4,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
 
 use crate::event::{envelope_cid, EventEnvelope, EventKind};
-use crate::util::{bytes_to_hex, to_dag_cbor};
+use crate::util::{bytes_to_hex, from_dag_cbor, to_dag_cbor};
 
 pub struct Store {
     pool: SqlitePool,
@@ -50,6 +50,21 @@ pub struct AccountRow {
     pub last_seen: i64,
 }
 
+/// author 別の遡行同期の進捗(sync_state 行)。cursor_cid/cursor_seq/completed は
+/// events から再導出できるキャッシュで、正典値は window_floor_seq のみ
+/// ([data-model.md] §6)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncStateRow {
+    pub pubkey: String,
+    /// 遡行下限 seq(これ未満のイベントは取得しない)
+    pub window_floor_seq: u64,
+    /// 最大 seq から prev で連続到達できる区間(run)の最下端イベントの cid
+    pub cursor_cid: Option<String>,
+    pub cursor_seq: Option<u64>,
+    /// 遡行終了(genesis 到達 or 窓下限到達)
+    pub completed: bool,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("SQLite error: {0}")]
@@ -72,7 +87,9 @@ impl Store {
             .connect_with(opts)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Store { pool })
+        let store = Store { pool };
+        store.backfill_target_cid().await?;
+        Ok(store)
     }
 
     pub async fn open_in_memory() -> Result<Self, StoreError> {
@@ -81,7 +98,82 @@ impl Store {
             .connect("sqlite::memory:")
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Store { pool })
+        let store = Store { pool };
+        store.backfill_target_cid().await?;
+        Ok(store)
+    }
+
+    /// migration 0005 以前に挿入され `target_cid` が未設定の Edit/Delete/Reply 行を
+    /// `raw_cbor` から修復し、空振りしていた projection を再適用する。
+    /// 冪等で、新規 DB や修復済み DB では0行。
+    async fn backfill_target_cid(&self) -> Result<(), StoreError> {
+        let rows = sqlx::query!(
+            "SELECT raw_cbor FROM events
+             WHERE kind_tag IN ('Edit', 'Delete', 'Reply') AND target_cid IS NULL"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for row in rows {
+            let envelope: EventEnvelope =
+                from_dag_cbor(&row.raw_cbor).map_err(StoreError::Serialization)?;
+            let cid_str = envelope_cid(&envelope).to_string();
+            let author = bytes_to_hex(envelope.payload.author.as_ref());
+            let seq = envelope.payload.seq as i64;
+            let mut tx = self.pool.begin().await?;
+            match &envelope.payload.kind {
+                EventKind::Edit { target, text } => {
+                    let target_str = target.to_string();
+                    sqlx::query!(
+                        "UPDATE events SET target_cid = ? WHERE cid = ?",
+                        target_str,
+                        cid_str
+                    )
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query!(
+                        "UPDATE posts SET text = ?, edited = 1, latest_edit_seq = ?
+                         WHERE cid = ? AND author = ? AND latest_edit_seq < ?",
+                        text,
+                        seq,
+                        target_str,
+                        author,
+                        seq
+                    )
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                EventKind::Delete { target } => {
+                    let target_str = target.to_string();
+                    sqlx::query!(
+                        "UPDATE events SET target_cid = ? WHERE cid = ?",
+                        target_str,
+                        cid_str
+                    )
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query!(
+                        "UPDATE posts SET deleted = 1 WHERE cid = ? AND author = ?",
+                        target_str,
+                        author
+                    )
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                EventKind::Reply { target, .. } => {
+                    let target_str = target.to_string();
+                    sqlx::query!(
+                        "UPDATE events SET target_cid = ? WHERE cid = ?",
+                        target_str,
+                        cid_str
+                    )
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                _ => {}
+            }
+            tx.commit().await?;
+        }
+        Ok(())
     }
 
     /// EventEnvelope を events テーブルに挿入し、projection を更新する。
@@ -97,13 +189,19 @@ impl Store {
         let kind_json = serde_json::to_string(&envelope.payload.kind)
             .map_err(|e| StoreError::Serialization(e.to_string()))?;
         let raw_cbor: Vec<u8> = to_dag_cbor(envelope);
+        let target_str = match &envelope.payload.kind {
+            EventKind::Edit { target, .. }
+            | EventKind::Delete { target }
+            | EventKind::Reply { target, .. } => Some(target.to_string()),
+            _ => None,
+        };
 
         let mut tx = self.pool.begin().await?;
 
         sqlx::query!(
             "INSERT OR IGNORE INTO events
-             (cid, author, seq, prev_cid, timestamp, kind_tag, kind_json, raw_cbor)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             (cid, author, seq, prev_cid, timestamp, kind_tag, kind_json, raw_cbor, target_cid)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             cid_str,
             author,
             seq,
@@ -111,7 +209,8 @@ impl Store {
             timestamp,
             kind_tag,
             kind_json,
-            raw_cbor
+            raw_cbor,
+            target_str
         )
         .execute(&mut *tx)
         .await?;
@@ -131,6 +230,11 @@ impl Store {
                 )
                 .execute(&mut *tx)
                 .await?;
+                // 遅延適用: この Post より先に到着していた Edit/Delete を反映する。
+                // 部分同期ではチャンク跨ぎで Edit/Delete が対象 Post より先に挿入
+                // されうるため、挿入順序に依存せず projection を収束させる
+                // (docs/data-model.md §6)
+                apply_pending_ops(&mut tx, &cid_str, &author).await?;
             }
             // Edit/Delete は target が同一 author の Post を指す場合のみ有効
             // (data-model.md §4)。author 条件がないと、他人の投稿 CID を target に
@@ -420,6 +524,85 @@ impl Store {
         Ok(())
     }
 
+    /// author 別の遡行同期の進捗を取得する。行が無い = 一度も同期を試みていない。
+    pub async fn get_sync_state(
+        &self,
+        pubkey_hex: &str,
+    ) -> Result<Option<SyncStateRow>, StoreError> {
+        let row = sqlx::query!(
+            "SELECT pubkey, window_floor_seq, cursor_cid, cursor_seq,
+             completed AS \"completed: bool\"
+             FROM sync_state WHERE pubkey = ?",
+            pubkey_hex
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| SyncStateRow {
+            pubkey: r.pubkey,
+            window_floor_seq: r.window_floor_seq as u64,
+            cursor_cid: r.cursor_cid,
+            cursor_seq: r.cursor_seq.map(|s| s as u64),
+            completed: r.completed,
+        }))
+    }
+
+    /// 遡行同期の進捗を保存する(全フィールド上書き)。
+    pub async fn upsert_sync_state(
+        &self,
+        row: &SyncStateRow,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        let floor = row.window_floor_seq as i64;
+        let cursor_seq = row.cursor_seq.map(|s| s as i64);
+        sqlx::query!(
+            "INSERT INTO sync_state
+             (pubkey, window_floor_seq, cursor_cid, cursor_seq, completed, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(pubkey) DO UPDATE SET
+                 window_floor_seq = excluded.window_floor_seq,
+                 cursor_cid       = excluded.cursor_cid,
+                 cursor_seq       = excluded.cursor_seq,
+                 completed        = excluded.completed,
+                 updated_at       = excluded.updated_at",
+            row.pubkey,
+            floor,
+            row.cursor_cid,
+            cursor_seq,
+            row.completed,
+            now_ms
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// author のチェーンで「最大 seq のイベントから prev を辿って連続到達できる
+    /// 区間(run)」の最下端を (cid, prev_cid, seq) で返す。イベントが無ければ None。
+    /// 部分同期の再開カーソルはこの導出値を正とする(書き込んだカーソルを
+    /// 信頼すると、既知ブロック到達による区間の合流や中断による分断と不整合になる)。
+    pub async fn get_chain_run_bottom(
+        &self,
+        pubkey_hex: &str,
+    ) -> Result<Option<(String, Option<String>, u64)>, StoreError> {
+        let row = sqlx::query!(
+            "WITH RECURSIVE run(cid, prev_cid, seq) AS (
+                 SELECT cid, prev_cid, seq FROM (
+                     SELECT cid, prev_cid, seq FROM events
+                     WHERE author = ? ORDER BY seq DESC LIMIT 1
+                 )
+                 UNION ALL
+                 SELECT e.cid, e.prev_cid, e.seq
+                 FROM events e JOIN run r ON e.cid = r.prev_cid
+             )
+             SELECT cid AS \"cid!: String\", prev_cid, seq AS \"seq!: i64\"
+             FROM run ORDER BY seq ASC LIMIT 1",
+            pubkey_hex
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| (r.cid, r.prev_cid, r.seq as u64)))
+    }
+
     /// チェーン上最新の Profile イベントの CID(レコードの profile_cid スナップショット用)。
     pub async fn get_latest_profile_cid(
         &self,
@@ -435,6 +618,54 @@ impl Store {
         .await?;
         Ok(row.map(|r| r.cid))
     }
+}
+
+/// 対象 Post の挿入時に、先に events へ到着していた同一 author の Edit/Delete を
+/// projection へ適用する(遅延適用)。Edit は seq 最大の1件(last-write-wins)。
+/// text は kind_json ではなく raw_cbor(正典)から取り出す。冪等。
+async fn apply_pending_ops(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    post_cid: &str,
+    author: &str,
+) -> Result<(), StoreError> {
+    let edit = sqlx::query!(
+        "SELECT seq, raw_cbor FROM events
+         WHERE target_cid = ? AND author = ? AND kind_tag = 'Edit'
+         ORDER BY seq DESC LIMIT 1",
+        post_cid,
+        author
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(row) = edit {
+        let envelope: EventEnvelope =
+            from_dag_cbor(&row.raw_cbor).map_err(StoreError::Serialization)?;
+        if let EventKind::Edit { text, .. } = &envelope.payload.kind {
+            sqlx::query!(
+                "UPDATE posts SET text = ?, edited = 1, latest_edit_seq = ?
+                 WHERE cid = ? AND latest_edit_seq < ?",
+                text,
+                row.seq,
+                post_cid,
+                row.seq
+            )
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+
+    sqlx::query!(
+        "UPDATE posts SET deleted = 1
+         WHERE cid = ?
+           AND EXISTS (SELECT 1 FROM events
+                       WHERE target_cid = ? AND author = ? AND kind_tag = 'Delete')",
+        post_cid,
+        post_cid,
+        author
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 fn kind_tag_str(kind: &EventKind) -> &'static str {
@@ -862,5 +1093,258 @@ mod tests {
         let posts = store.get_posts_by_author(&pubkey_hex).await.unwrap();
         assert_eq!(posts.len(), 2);
         assert_eq!(posts[0].text, "second");
+    }
+
+    // --- Edit/Delete の遅延適用(部分同期でのチャンク跨ぎ順序逆転への耐性) ---
+
+    #[tokio::test]
+    async fn edit_before_post_is_applied_on_post_insert() {
+        let store = make_store().await;
+        let identity = Identity::generate();
+        let pubkey_hex = bytes_to_hex(&identity.public_key_bytes());
+
+        let post = create_envelope(
+            &identity,
+            0,
+            None,
+            EventKind::Post {
+                text: "original".to_string(),
+            },
+        );
+        let post_cid = envelope_cid(&post);
+
+        let edit = create_envelope(
+            &identity,
+            1,
+            Some(post_cid.clone()),
+            EventKind::Edit {
+                text: "edited".to_string(),
+                target: post_cid,
+            },
+        );
+
+        // Edit が対象 Post より先に到着(チャンク跨ぎの順序逆転)
+        store.insert_event(&edit).await.unwrap();
+        store.insert_event(&post).await.unwrap();
+
+        let posts = store.get_posts_by_author(&pubkey_hex).await.unwrap();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].text, "edited");
+        assert!(posts[0].edited);
+    }
+
+    #[tokio::test]
+    async fn delete_before_post_is_applied_on_post_insert() {
+        let store = make_store().await;
+        let identity = Identity::generate();
+        let pubkey_hex = bytes_to_hex(&identity.public_key_bytes());
+
+        let post = create_envelope(
+            &identity,
+            0,
+            None,
+            EventKind::Post {
+                text: "bye".to_string(),
+            },
+        );
+        let post_cid = envelope_cid(&post);
+
+        let del = create_envelope(
+            &identity,
+            1,
+            Some(post_cid.clone()),
+            EventKind::Delete { target: post_cid },
+        );
+
+        store.insert_event(&del).await.unwrap();
+        store.insert_event(&post).await.unwrap();
+
+        let posts = store.get_posts_by_author(&pubkey_hex).await.unwrap();
+        assert!(posts[0].deleted);
+    }
+
+    #[tokio::test]
+    async fn edit_lww_is_insertion_order_independent() {
+        let store = make_store().await;
+        let identity = Identity::generate();
+        let pubkey_hex = bytes_to_hex(&identity.public_key_bytes());
+
+        let post = create_envelope(
+            &identity,
+            0,
+            None,
+            EventKind::Post {
+                text: "v0".to_string(),
+            },
+        );
+        let post_cid = envelope_cid(&post);
+        let make_edit = |seq: u64, text: &str| {
+            create_envelope(
+                &identity,
+                seq,
+                Some(post_cid.clone()),
+                EventKind::Edit {
+                    text: text.to_string(),
+                    target: post_cid.clone(),
+                },
+            )
+        };
+
+        // seq5 → seq3 → Post の順で挿入しても LWW(seq 最大)が勝つ
+        store.insert_event(&make_edit(5, "v5")).await.unwrap();
+        store.insert_event(&make_edit(3, "v3")).await.unwrap();
+        store.insert_event(&post).await.unwrap();
+        let posts = store.get_posts_by_author(&pubkey_hex).await.unwrap();
+        assert_eq!(posts[0].text, "v5");
+
+        // 後から届いた古い Edit(seq4)は無効、新しい Edit(seq6)は有効
+        store.insert_event(&make_edit(4, "v4")).await.unwrap();
+        let posts = store.get_posts_by_author(&pubkey_hex).await.unwrap();
+        assert_eq!(posts[0].text, "v5");
+
+        store.insert_event(&make_edit(6, "v6")).await.unwrap();
+        let posts = store.get_posts_by_author(&pubkey_hex).await.unwrap();
+        assert_eq!(posts[0].text, "v6");
+    }
+
+    /// 直接適用経路の author 強制は cross_author_edit_is_ignored /
+    /// cross_author_delete_is_ignored が検証する。ここは遅延適用経路
+    /// (対象 Post より先に到着した場合)でも同じ強制が働くことの検証。
+    #[tokio::test]
+    async fn cross_author_pending_ops_are_ignored() {
+        let store = make_store().await;
+        let alice = Identity::generate();
+        let alice_hex = bytes_to_hex(&alice.public_key_bytes());
+        let mallory = Identity::generate();
+
+        let post = create_envelope(
+            &alice,
+            0,
+            None,
+            EventKind::Post {
+                text: "alice's post".to_string(),
+            },
+        );
+        let post_cid = envelope_cid(&post);
+
+        // 他 author の Edit/Delete が対象 Post より先に届いている状態
+        let evil_edit = create_envelope(
+            &mallory,
+            0,
+            None,
+            EventKind::Edit {
+                text: "hacked".to_string(),
+                target: post_cid.clone(),
+            },
+        );
+        let evil_delete = create_envelope(
+            &mallory,
+            1,
+            None,
+            EventKind::Delete { target: post_cid },
+        );
+        store.insert_event(&evil_edit).await.unwrap();
+        store.insert_event(&evil_delete).await.unwrap();
+
+        // Post 挿入時の遅延適用でも他 author の Edit/Delete は無視される
+        store.insert_event(&post).await.unwrap();
+
+        let posts = store.get_posts_by_author(&alice_hex).await.unwrap();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].text, "alice's post");
+        assert!(!posts[0].edited);
+        assert!(!posts[0].deleted);
+    }
+
+    #[tokio::test]
+    async fn pending_ops_are_idempotent_on_reinsert() {
+        let store = make_store().await;
+        let identity = Identity::generate();
+        let pubkey_hex = bytes_to_hex(&identity.public_key_bytes());
+
+        let post = create_envelope(
+            &identity,
+            0,
+            None,
+            EventKind::Post {
+                text: "original".to_string(),
+            },
+        );
+        let post_cid = envelope_cid(&post);
+        let edit = create_envelope(
+            &identity,
+            1,
+            Some(post_cid.clone()),
+            EventKind::Edit {
+                text: "edited".to_string(),
+                target: post_cid,
+            },
+        );
+
+        store.insert_event(&edit).await.unwrap();
+        store.insert_event(&post).await.unwrap();
+        // 同じイベントの再挿入(部分同期の再開で起こりうる)で結果が変わらない
+        store.insert_event(&post).await.unwrap();
+        store.insert_event(&edit).await.unwrap();
+
+        let posts = store.get_posts_by_author(&pubkey_hex).await.unwrap();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].text, "edited");
+    }
+
+    #[tokio::test]
+    async fn backfill_repairs_target_cid_and_projection() {
+        let store = make_store().await;
+        let identity = Identity::generate();
+        let pubkey_hex = bytes_to_hex(&identity.public_key_bytes());
+
+        let post = create_envelope(
+            &identity,
+            0,
+            None,
+            EventKind::Post {
+                text: "original".to_string(),
+            },
+        );
+        let post_cid = envelope_cid(&post);
+        let post_cid_str = post_cid.to_string();
+        let edit = create_envelope(
+            &identity,
+            1,
+            Some(post_cid.clone()),
+            EventKind::Edit {
+                text: "edited".to_string(),
+                target: post_cid,
+            },
+        );
+        store.insert_event(&post).await.unwrap();
+        store.insert_event(&edit).await.unwrap();
+
+        // migration 0005 以前の状態を再現: target_cid なし + projection 空振り
+        sqlx::query!("UPDATE events SET target_cid = NULL WHERE kind_tag = 'Edit'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query!(
+            "UPDATE posts SET text = 'original', edited = 0, latest_edit_seq = 0
+             WHERE cid = ?",
+            post_cid_str
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        store.backfill_target_cid().await.unwrap();
+
+        let posts = store.get_posts_by_author(&pubkey_hex).await.unwrap();
+        assert_eq!(posts[0].text, "edited");
+        assert!(posts[0].edited);
+        let remaining = sqlx::query!(
+            "SELECT COUNT(*) AS n FROM events WHERE kind_tag = 'Edit' AND target_cid IS NULL"
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining.n, 0);
     }
 }

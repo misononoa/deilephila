@@ -261,10 +261,15 @@ pub async fn handle_head_received(
         }
     }
     match crate::sync::handle_head_record(store, network, record, Some(source)).await {
-        Ok(outcome) if outcome.new_events > 0 => {
-            notify.notify(UiEvent::TimelineUpdated);
+        Ok(outcome) => {
+            // 部分的な進捗でも取れた分は即表示に反映する
+            if outcome.new_events > 0 {
+                notify.notify(UiEvent::TimelineUpdated);
+            }
+            if !outcome.completed {
+                tracing::info!("chain sync incomplete; will resume on next announce/resolve");
+            }
         }
-        Ok(_) => {}
         Err(e) => tracing::warn!("chain sync failed: {e}"),
     }
 }
