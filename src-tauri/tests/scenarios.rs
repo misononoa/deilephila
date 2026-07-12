@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::TestApp;
-use deilephila_lib::app::{self, AppState, Notifier, UiEvent};
+use deilephila_lib::app::{self, AppError, AppState, Notifier, UiEvent};
 use deilephila_lib::head::feed_topic_str;
+use deilephila_lib::keystore::KeystoreError;
 use deilephila_lib::network::NetworkHandle;
 use deilephila_lib::store::Store;
 use deilephila_lib::util::hex_to_pubkey;
@@ -136,7 +137,10 @@ async fn restart_unlock_restores_chain_and_subscriptions() {
     assert!(status.setup && !status.unlocked);
 
     // 誤パスフレーズは拒否され、状態は変わらない
-    assert!(app::unlock_account(&a.state, "wrong".into()).await.is_err());
+    assert!(matches!(
+        app::unlock_account(&a.state, "wrong".into()).await,
+        Err(AppError::Keystore(KeystoreError::WrongPassphrase))
+    ));
     assert!(!app::get_app_status(&a.state).await.unwrap().unlocked);
 
     // 正しい unlock: 同一アカウントに復元される
@@ -198,7 +202,9 @@ async fn unlock_recovers_missed_posts_via_dht() {
 
     // A 再接続 + unlock。フォロー購読の復元と同時に DHT 回収が走る
     a.connect(&b).await;
-    app::unlock_account(&a.state, "pass-a".into()).await.unwrap();
+    app::unlock_account(&a.state, "pass-a".into())
+        .await
+        .unwrap();
 
     let timeline = a
         .wait_timeline(|t| {
@@ -263,10 +269,23 @@ async fn command_error_paths() {
     // 未セットアップ・未アンロック
     let status = app::get_app_status(&state).await.unwrap();
     assert!(!status.setup && !status.unlocked);
-    assert!(app::create_post(&state, "x".into()).await.is_err());
-    assert!(app::get_timeline(&state).await.is_err());
-    assert!(app::follow_user(&state, "ab".repeat(32)).await.is_err());
-    assert!(app::unlock_account(&state, "pass".into()).await.is_err());
+    assert!(matches!(
+        app::create_post(&state, "x".into()).await,
+        Err(AppError::NotUnlocked)
+    ));
+    assert!(matches!(
+        app::get_timeline(&state).await,
+        Err(AppError::NotUnlocked)
+    ));
+    assert!(matches!(
+        app::follow_user(&state, "ab".repeat(32)).await,
+        Err(AppError::NotUnlocked)
+    ));
+    // Keystore ファイルが存在しないため keystore 系エラー(I/O)になる
+    assert!(matches!(
+        app::unlock_account(&state, "pass".into()).await,
+        Err(AppError::Keystore(KeystoreError::Io(_)))
+    ));
 
     // セットアップで unlocked になる
     let pk = app::setup_account(&state, "pass".into()).await.unwrap();
@@ -274,13 +293,28 @@ async fn command_error_paths() {
     assert!(status.setup && status.unlocked);
 
     // 二重セットアップは拒否
-    assert!(app::setup_account(&state, "other".into()).await.is_err());
+    assert!(matches!(
+        app::setup_account(&state, "other".into()).await,
+        Err(AppError::AlreadyExists)
+    ));
 
     // 自己フォロー・不正な公開鍵は拒否
-    assert!(app::follow_user(&state, pk.clone()).await.is_err());
-    assert!(app::follow_user(&state, "not-hex".into()).await.is_err());
-    assert!(app::follow_user(&state, "abcd".into()).await.is_err());
+    assert!(matches!(
+        app::follow_user(&state, pk.clone()).await,
+        Err(AppError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        app::follow_user(&state, "not-hex".into()).await,
+        Err(AppError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        app::follow_user(&state, "abcd".into()).await,
+        Err(AppError::InvalidInput(_))
+    ));
 
     // 誤パスフレーズの unlock は失敗する
-    assert!(app::unlock_account(&state, "wrong".into()).await.is_err());
+    assert!(matches!(
+        app::unlock_account(&state, "wrong".into()).await,
+        Err(AppError::Keystore(KeystoreError::WrongPassphrase))
+    ));
 }
