@@ -1,0 +1,57 @@
+# 再利用可能なテストワークフロー。ci.yml(PR/push)と release.yml(タグ)の両方から呼ばれる。
+name: Test
+
+on:
+  workflow_call:
+
+jobs:
+  test:
+    # AppImage との互換性を広く保つため、リリースビルドと同じ古めのイメージで統一
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: バージョン一致を検証 (tauri.conf.json / Cargo.toml / package.json)
+        run: bash .github/scripts/check-version.sh
+
+      # tauri クレート(wry/tao)のコンパイルに WebKitGTK 等のシステムライブラリが必要
+      - name: Tauri のシステム依存をインストール
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            build-essential \
+            curl \
+            wget \
+            file
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: フロントエンド依存をインストール
+        run: pnpm install --frozen-lockfile
+
+      # `tauri::generate_context!` が dist/ をコンパイル時に埋め込むため、
+      # cargo test の前にフロントエンドのビルドが必要(vue-tsc の型チェックも兼ねる)
+      - name: フロントエンド型チェック + ビルド
+        run: pnpm build
+
+      - name: Rust テスト
+        run: cargo test
+        working-directory: src-tauri
