@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT p.cid, p.author, p.text, p.timestamp,\n               p.edited AS \"edited: bool\",\n               p.deleted AS \"deleted: bool\",\n               NULLIF(a.display_name, '') AS \"display_name?: String\"\n               FROM posts p\n               LEFT JOIN accounts a ON a.pubkey = p.author\n               WHERE p.author = ? OR p.author IN (SELECT pubkey FROM follows)\n               ORDER BY p.timestamp DESC",
+  "query": "SELECT p.cid, p.author, p.text, p.timestamp,\n               p.edited AS \"edited: bool\",\n               p.deleted AS \"deleted: bool\",\n               COALESCE(NULLIF(a.display_name, ''), NULLIF(a.snapshot_display_name, ''))\n                   AS \"display_name?: String\"\n               FROM posts p\n               LEFT JOIN accounts a ON a.pubkey = p.author\n               WHERE p.author = ? OR p.author IN (SELECT pubkey FROM follows)\n               ORDER BY p.timestamp DESC",
   "describe": {
     "columns": [
       {
@@ -52,5 +52,5 @@
       null
     ]
   },
-  "hash": "da98f730e5a2598e05afcb10aa2d66822c72f90e1b5d8220527a2116d4274b14"
+  "hash": "5be20c403fad0e1e9413a5fca331d7b832cfad6633b90061a0cc991c4d73fbfb"
 }

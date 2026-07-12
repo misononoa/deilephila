@@ -125,7 +125,7 @@ headポインタは新規イベント(投稿・編集・削除・プロフィー
 | Tier 0 | IPNS-headレコード(§2.4)に同梱 | `display_name` + `profile_cid` | = head の可用性 |
 | Tier 1 | チェーン上最新の `Profile` イベント | bio、アバター等のフル項目 | ベストエフォート |
 
-- 正典はチェーンの `Profile` イベントであり、スナップショットは可用性のための非正規化キャッシュ。イベントチェーンをfoldし最新の`Profile`イベントに到達できたらそちらを優先する(不一致時はチェーンが勝つ)。
+- 正典はチェーンの `Profile` イベントであり、スナップショットは可用性のための非正規化キャッシュ。イベントチェーンをfoldし最新の`Profile`イベントに到達できたらそちらを優先する(不一致時はチェーンが勝つ)。SQLite 上も出所ごとに別列で保持し(§6 `accounts` の display_name / snapshot_display_name)、表示は「Tier 1 が非空ならそれ、無ければ Tier 0」の順で解決する。Tier 0 は同梱元レコードの `sequence` が既知のスナップショットより新しいときだけ上書きする(stale なレコードでの巻き戻しを防ぐ)。
 - 現在のフルプロフィール = チェーンを head から走査して見つかる最新の `Profile` イベントだが、 IPNS-headレコードに `profile_cid`があれば走査せず1ホップで直接取得できる。
 - 表示名変更時: チェーンに `Profile` イベントを追記(head 更新)し、次の IPNS-headレコードが新 `display_name` / `profile_cid` を自然に同梱する(投稿が無くても profile 変更だけで seq+1 の再発行が可能)。
 - プロフィール描画の劣化段階: IPNS-headレコードあり→表示名を描画 / チェーン到達→フルプロフィール / 何も無し→短縮公開鍵プレースホルダ
@@ -157,7 +157,7 @@ projection は純粋な関数(`events` の fold)なので、DBが壊れても `e
 |-----------------|------|--------|
 | `events` | 検証済み生イベント(チェーンそのもの。検証は挿入前に実施) | cid, author, seq, prev_cid, timestamp, kind_tag, kind_json, raw_cbor(DAG-CBOR 原文 — ブロック提供と再検証の源泉), target_cid(`Edit`/`Delete`/`Reply` の対象 CID。遅延適用の索引) |
 | `posts` | `Post`+`Edit`+`Delete` を fold した表示用投稿 | cid(=生成イベント), author, seq, text(編集適用後), timestamp, edited, deleted, latest_edit_seq(last-write-wins 判定用) |
-| `accounts` | プロフィール fold 結果 + head 記録 | pubkey, display_name, bio, latest_head_cid, last_seen |
+| `accounts` | プロフィール fold 結果 + head 記録 | pubkey, display_name(Tier 1。チェーンの `Profile` fold 由来), bio, latest_head_cid, last_seen, snapshot_display_name(Tier 0。IPNS-headレコード同梱値のキャッシュ), snapshot_seq(snapshot_display_name の同梱元レコードの sequence。表示解決は §3 参照) |
 | `head_records` | 最新 IPNS-headレコードの常時保持(自分 + フォロー相手。[networking.md](networking.md) §3.2) | pubkey, sequence, record_bytes(署名済みレコードの DAG-CBOR 原文), updated_at |
 | `sync_state` | author 別の遡行同期の進捗([networking.md](networking.md) §4.4) | pubkey, window_floor_seq(遡行下限。正典値), cursor_cid / cursor_seq(取得済み区間最下端。events から再導出できるキャッシュ), completed(遡行完了フラグ), updated_at |
 | `follows` | フォローリスト | pubkey, since |
