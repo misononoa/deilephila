@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT f.pubkey, f.since,\n               NULLIF(a.display_name, '') AS \"display_name?: String\"\n               FROM follows f\n               LEFT JOIN accounts a ON a.pubkey = f.pubkey\n               ORDER BY f.since DESC",
+  "query": "SELECT f.pubkey, f.since,\n               COALESCE(NULLIF(a.display_name, ''), NULLIF(a.snapshot_display_name, ''))\n                   AS \"display_name?: String\"\n               FROM follows f\n               LEFT JOIN accounts a ON a.pubkey = f.pubkey\n               ORDER BY f.since DESC",
   "describe": {
     "columns": [
       {
@@ -28,5 +28,5 @@
       null
     ]
   },
-  "hash": "2de1c583901c84a09be6ad2bd54a4452150ed5beb419a85da33301c1c7efb0d6"
+  "hash": "24951a8288fe824b94f6e55b8153a1ab425bd91d023e49b482ce34aed0eaff9f"
 }

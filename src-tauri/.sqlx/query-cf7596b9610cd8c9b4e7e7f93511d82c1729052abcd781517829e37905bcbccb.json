@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO accounts (pubkey, snapshot_display_name, snapshot_seq)\n             VALUES (?, ?, ?)\n             ON CONFLICT(pubkey) DO UPDATE SET\n                 snapshot_display_name = excluded.snapshot_display_name,\n                 snapshot_seq = excluded.snapshot_seq\n             WHERE excluded.snapshot_seq > accounts.snapshot_seq",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "cf7596b9610cd8c9b4e7e7f93511d82c1729052abcd781517829e37905bcbccb"
+}
