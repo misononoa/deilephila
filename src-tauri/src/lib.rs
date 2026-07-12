@@ -92,10 +92,18 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 while let Some(event) = ui_rx.recv().await {
                     // 接続・購読イベントは現状 UI 未使用(app.rs の UiEvent 参照)
-                    if let UiEvent::TimelineUpdated = event {
-                        if let Err(e) = app_handle.emit("timeline-updated", ()) {
-                            tracing::warn!("emit timeline-updated failed: {e}");
+                    match event {
+                        UiEvent::TimelineUpdated => {
+                            if let Err(e) = app_handle.emit("timeline-updated", ()) {
+                                tracing::warn!("emit timeline-updated failed: {e}");
+                            }
                         }
+                        UiEvent::ForkDetected { author } => {
+                            if let Err(e) = app_handle.emit("fork-detected", author) {
+                                tracing::warn!("emit fork-detected failed: {e}");
+                            }
+                        }
+                        _ => {}
                     }
                 }
             });
@@ -129,6 +137,7 @@ pub fn run() {
             commands::unfollow_user,
             commands::get_follows,
             commands::get_timeline,
+            commands::get_forks,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

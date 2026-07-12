@@ -63,6 +63,9 @@ pub struct SyncOutcome {
     /// 遡行が genesis または窓下限まで到達済みか。
     /// false = 未取得区間が残っており、次回の announce/resolve で再開される
     pub completed: bool,
+    /// この同期で新たに記録された fork の件数(head 層 + イベント層)。
+    /// 呼び出し側(app.rs)が UI への警告通知に使う
+    pub forks_detected: usize,
 }
 
 /// 遡行の停止理由。ブロック取得失敗と予算切れはエラーではなく停止として扱う
@@ -134,7 +137,10 @@ pub(crate) async fn handle_head_record_with_limits(
     let author_hex = bytes_to_hex(record.payload.name.as_ref());
     let head_cid_str = record.payload.value.to_string();
 
-    store.upsert_head_record(record, now_ms()).await?;
+    let mut forks_detected = store
+        .upsert_head_record(record, now_ms())
+        .await?
+        .forks_recorded;
     if !record.payload.display_name.is_empty() {
         store
             .fill_display_name_snapshot(&author_hex, &record.payload.display_name)
@@ -161,6 +167,7 @@ pub(crate) async fn handle_head_record_with_limits(
             return Ok(SyncOutcome {
                 new_events: 0,
                 completed: true,
+                forks_detected,
             });
         }
     }
@@ -182,6 +189,7 @@ pub(crate) async fn handle_head_record_with_limits(
             floor,
             &mut budget,
             limits.chunk,
+            &mut forks_detected,
         )
         .await?;
         new_events += n;
@@ -210,6 +218,7 @@ pub(crate) async fn handle_head_record_with_limits(
                         floor,
                         &mut budget,
                         limits.chunk,
+                        &mut forks_detected,
                     )
                     .await?;
                     new_events += n;
@@ -258,6 +267,7 @@ pub(crate) async fn handle_head_record_with_limits(
     Ok(SyncOutcome {
         new_events,
         completed,
+        forks_detected,
     })
 }
 
@@ -275,6 +285,7 @@ async fn traverse_and_ingest(
     floor: u64,
     budget: &mut usize,
     chunk: usize,
+    forks_detected: &mut usize,
 ) -> Result<(usize, StopKind), StoreError> {
     let mut inserted = 0usize;
     let mut buffer: Vec<EventEnvelope> = Vec::new();
@@ -323,11 +334,11 @@ async fn traverse_and_ingest(
         expected_seq = expected_seq.saturating_sub(1);
         buffer.push(envelope);
         if buffer.len() >= chunk {
-            flush_chunk(store, &mut buffer, &mut inserted).await?;
+            flush_chunk(store, &mut buffer, &mut inserted, forks_detected).await?;
         }
     };
 
-    flush_chunk(store, &mut buffer, &mut inserted).await?;
+    flush_chunk(store, &mut buffer, &mut inserted, forks_detected).await?;
     Ok((inserted, stop))
 }
 
@@ -338,9 +349,10 @@ async fn flush_chunk(
     store: &Store,
     buffer: &mut Vec<EventEnvelope>,
     inserted: &mut usize,
+    forks_detected: &mut usize,
 ) -> Result<(), StoreError> {
     for envelope in buffer.iter().rev() {
-        store.insert_event(envelope).await?;
+        *forks_detected += store.insert_event(envelope).await?.forks_recorded;
     }
     *inserted += buffer.len();
     buffer.clear();
@@ -878,6 +890,7 @@ mod tests {
             .unwrap();
         assert_eq!(o1.new_events, 2);
         assert!(o1.completed);
+        assert_eq!(o1.forks_detected, 0);
         assert!(store_b.list_forks(None).await.unwrap().is_empty());
 
         // 2本目のブランチ: 拒否されず取り込まれ、両層の fork が記録される
@@ -887,6 +900,7 @@ mod tests {
             .unwrap();
         assert_eq!(o2.new_events, 1);
         assert!(o2.completed);
+        assert_eq!(o2.forks_detected, 2); // head 層 1 + イベント層 1
 
         let forks = store_b.list_forks(Some(&author_hex)).await.unwrap();
         assert!(forks.iter().any(|f| f.layer == "head" && f.seq == 1));

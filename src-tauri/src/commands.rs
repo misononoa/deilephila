@@ -2,7 +2,7 @@
 //! 委譲する `#[tauri::command]` ラッパのみを置く。関数名 = invoke 名。
 //! ロジックはすべて app.rs 側にあり、この層は Tauri の型(`State`)を剥がすだけ。
 
-use crate::app::{self, AppState, AppStatus, FollowView, PostView};
+use crate::app::{self, AppState, AppStatus, FollowView, ForkView, PostView};
 
 #[tauri::command]
 pub async fn get_app_status(state: tauri::State<'_, AppState>) -> Result<AppStatus, String> {
@@ -57,4 +57,9 @@ pub async fn get_follows(state: tauri::State<'_, AppState>) -> Result<Vec<Follow
 #[tauri::command]
 pub async fn get_timeline(state: tauri::State<'_, AppState>) -> Result<Vec<PostView>, String> {
     app::get_timeline(state.inner()).await
+}
+
+#[tauri::command]
+pub async fn get_forks(state: tauri::State<'_, AppState>) -> Result<Vec<ForkView>, String> {
+    app::get_forks(state.inner()).await
 }

@@ -55,6 +55,9 @@ fn normalize_pubkey_hex(input: &str) -> Result<String, String> {
 #[derive(Debug, Clone)]
 pub enum UiEvent {
     TimelineUpdated,
+    /// 同期中に fork(equivocation)を新規に記録した(data-model.md §2.1)。
+    /// フロントは警告表示の更新(get_forks の再取得)に使う
+    ForkDetected { author: String },
     PeerConnected(PeerId),
     PeerSubscribed { peer: PeerId, topic: String },
 }
@@ -190,6 +193,18 @@ pub struct FollowView {
     pub display_name: Option<String>,
 }
 
+/// fork 記録の表示用ビュー(証拠 bytes は含めない)。
+#[derive(Debug, Serialize)]
+pub struct ForkView {
+    pub author: String,
+    /// "event"(チェーン層)| "head"(IPNS-headレコード層)
+    pub layer: String,
+    pub seq: u64,
+    pub cid_a: String,
+    pub cid_b: String,
+    pub observed_at: i64,
+}
+
 // --- AppState ---
 
 /// アカウントがアンロックされているときのインメモリ状態。
@@ -258,6 +273,11 @@ pub async fn handle_head_received(
             if outcome.new_events > 0 {
                 notify.notify(UiEvent::TimelineUpdated);
             }
+            if outcome.forks_detected > 0 {
+                notify.notify(UiEvent::ForkDetected {
+                    author: author_hex.clone(),
+                });
+            }
             if !outcome.completed {
                 tracing::info!("chain sync incomplete; will resume on next announce/resolve");
             }
@@ -304,16 +324,18 @@ pub async fn sync_follow_target(
     // 候補集合中の fork を選択前に観測して記録する。`select_best` が選ばない側
     // (保持中 best より古い sequence の fork ペアを含む)はこの後の同期には
     // 現れないため、ここが唯一の観測点(docs/data-model.md §2.1)
+    let mut candidate_forks = 0usize;
     for (a, b) in find_record_forks(&pubkey, &candidates) {
-        store.record_head_fork(a, b).await.cmd()?;
+        candidate_forks += store.record_head_fork(a, b).await.cmd()?;
     }
     let Some(record) = select_best(&pubkey, candidates.iter()) else {
         return Ok(None);
     };
-    crate::sync::handle_head_record(store, network, record, None)
+    let mut outcome = crate::sync::handle_head_record(store, network, record, None)
         .await
-        .map(Some)
-        .cmd()
+        .cmd()?;
+    outcome.forks_detected += candidate_forks;
+    Ok(Some(outcome))
 }
 
 /// フォロー相手の最新レコードを DHT から解決し、チェーンを取り込むバックグラウンド
@@ -339,6 +361,11 @@ fn spawn_sync_follow_target(
                 Ok(Some(outcome)) => {
                     if outcome.new_events > 0 {
                         notify.notify(UiEvent::TimelineUpdated);
+                    }
+                    if outcome.forks_detected > 0 {
+                        notify.notify(UiEvent::ForkDetected {
+                            author: pubkey_hex.clone(),
+                        });
                     }
                     return;
                 }
@@ -518,6 +545,22 @@ pub async fn get_timeline(state: &AppState) -> Result<Vec<PostView>, String> {
     Ok(rows.into_iter().map(PostView::from).collect())
 }
 
+/// fork(equivocation)の記録を返す(UI の警告表示用。data-model.md §2.1)。
+pub async fn get_forks(state: &AppState) -> Result<Vec<ForkView>, String> {
+    let rows = state.store.list_forks(None).await.cmd()?;
+    Ok(rows
+        .into_iter()
+        .map(|f| ForkView {
+            author: f.author,
+            layer: f.layer,
+            seq: f.seq,
+            cid_a: f.cid_a,
+            cid_b: f.cid_b,
+            observed_at: f.observed_at,
+        })
+        .collect())
+}
+
 // --- テスト ---
 
 #[cfg(test)]
@@ -567,5 +610,46 @@ mod tests {
         assert_eq!(seq, 1);
         let account = store.get_account(&author_hex).await.unwrap().unwrap();
         assert_eq!(account.display_name, "Alice");
+    }
+
+    #[tokio::test]
+    async fn fork_notifies_ui_event() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (notify, mut ui_rx) = Notifier::channel();
+        let followee = Identity::generate();
+        let author_hex = bytes_to_hex(&followee.public_key_bytes());
+        store.add_follow(&author_hex, now_ms()).await.unwrap();
+
+        // 同一 sequence で異なる head CID を指す2レコード(equivocation)
+        let record_a = crate::head::create_ipns_record(
+            &followee,
+            1,
+            crate::util::bytes_to_cid(b"head a"),
+            far_future_ms(),
+            None,
+            String::new(),
+        );
+        let record_b = crate::head::create_ipns_record(
+            &followee,
+            1,
+            crate::util::bytes_to_cid(b"head b"),
+            far_future_ms(),
+            None,
+            String::new(),
+        );
+
+        handle_head_received(&store, &dummy_network(), &record_a, dummy_source(), &notify).await;
+        handle_head_received(&store, &dummy_network(), &record_b, dummy_source(), &notify).await;
+
+        // 2通目で head 層の fork が記録され、ForkDetected が通知される
+        let mut fork_notified = false;
+        while let Ok(event) = ui_rx.try_recv() {
+            if let UiEvent::ForkDetected { author } = event {
+                assert_eq!(author, author_hex);
+                fork_notified = true;
+            }
+        }
+        assert!(fork_notified);
+        assert!(store.has_fork(&author_hex).await.unwrap());
     }
 }
