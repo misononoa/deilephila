@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # 動作確認用の手動起動。ビルドまで行い、リリースは作成せず Artifacts に AppImage を残す
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
+  build-release:
+    needs: test
+    # AppImage は古い glibc でビルドするほど動作互換性が広いため 22.04 を使用
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: バージョン検証とプロファイル判定
+        id: version
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            bash .github/scripts/check-version.sh "${version}"
+          else
+            bash .github/scripts/check-version.sh
+            version=$(jq -r .version src-tauri/tauri.conf.json)
+          fi
+          # プレリリース判定: major が 0(1.0.0 未満)または `-` プレリリース部を持つ
+          if [[ "${version%%.*}" == "0" || "${version}" == *-* ]]; then
+            prerelease=true
+          else
+            prerelease=false
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
+          echo "プレリリース: ${prerelease}"
+
+      - name: Tauri のシステム依存をインストール
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            build-essential \
+            curl \
+            wget \
+            file
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: フロントエンド依存をインストール
+        run: pnpm install --frozen-lockfile
+
+      # プレリリースは --debug(dev プロファイル・devtools 有効)、正式リリースは release プロファイル
+      - name: AppImage をビルド
+        env:
+          # CI 上で linuxdeploy の strip が失敗することがあるため無効化
+          NO_STRIP: "true"
+        run: |
+          args="--bundles appimage"
+          if [[ "${{ steps.version.outputs.prerelease }}" == "true" ]]; then
+            args="--debug ${args}"
+          fi
+          pnpm tauri build ${args}
+
+      - name: GitHub Release を作成 (AppImage のみ添付)
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: src-tauri/target/*/bundle/appimage/*.AppImage
+          prerelease: ${{ steps.version.outputs.prerelease }}
+          generate_release_notes: true
+
+      - name: AppImage を Artifacts にアップロード (手動起動時のドライラン)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: deilephila-${{ steps.version.outputs.version }}-appimage
+          path: src-tauri/target/*/bundle/appimage/*.AppImage
