@@ -3,8 +3,11 @@ use std::path::Path;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
 
+use tracing::warn;
+
 use crate::event::{envelope_cid, EventEnvelope, EventKind};
-use crate::util::{bytes_to_hex, from_dag_cbor, to_dag_cbor};
+use crate::head::{record_from_bytes, record_to_bytes, IpnsRecord};
+use crate::util::{bytes_to_hex, from_dag_cbor, now_ms, to_dag_cbor};
 
 pub struct Store {
     pool: SqlitePool,
@@ -48,6 +51,25 @@ pub struct AccountRow {
     pub bio: String,
     pub latest_head_cid: Option<String>,
     pub last_seen: i64,
+}
+
+/// forks テーブルの1行(証拠 bytes は含めない。一覧表示・件数確認用)。
+#[derive(Debug, Clone)]
+pub struct ForkRow {
+    pub author: String,
+    /// 'event'(チェーン層)| 'head'(IPNS-headレコード層)
+    pub layer: String,
+    pub seq: u64,
+    pub cid_a: String,
+    pub cid_b: String,
+    pub observed_at: i64,
+}
+
+/// insert_event / upsert_head_record の結果。fork の検出数を同期層へ運ぶ。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct InsertOutcome {
+    /// この呼び出しで新たに記録された fork の件数(既知ペアの再観測は数えない)
+    pub forks_recorded: usize,
 }
 
 /// author 別の遡行同期の進捗(sync_state 行)。cursor_cid/cursor_seq/completed は
@@ -178,7 +200,11 @@ impl Store {
 
     /// EventEnvelope を events テーブルに挿入し、projection を更新する。
     /// 同じ CID が既存の場合は無視する(冪等)。events と projection はトランザクションで原子的に更新。
-    pub async fn insert_event(&self, envelope: &EventEnvelope) -> Result<(), StoreError> {
+    /// 挿入前に同一 author+seq で異なる CID の既存イベントと照合し、不一致があれば
+    /// fork(equivocation)として forks へ記録する(docs/data-model.md §2.1)。
+    /// 検出しても挿入は継続する: 整合性は個別署名で保たれており、UNIQUE 制約での
+    /// 拒否は「先に届いた方が勝つ」非決定性を生むため採らない。
+    pub async fn insert_event(&self, envelope: &EventEnvelope) -> Result<InsertOutcome, StoreError> {
         let cid = envelope_cid(envelope);
         let cid_str = cid.to_string();
         let author = bytes_to_hex(envelope.payload.author.as_ref());
@@ -198,6 +224,9 @@ impl Store {
 
         let mut tx = self.pool.begin().await?;
 
+        // トランザクションの先頭は必ず書き込みにする: WAL では読み取りで始まった
+        // DEFERRED トランザクションの書き込み昇格が、並行書き込みと競合すると
+        // busy_timeout の効かない即時 SQLITE_BUSY になるため
         sqlx::query!(
             "INSERT OR IGNORE INTO events
              (cid, author, seq, prev_cid, timestamp, kind_tag, kind_json, raw_cbor, target_cid)
@@ -214,6 +243,36 @@ impl Store {
         )
         .execute(&mut *tx)
         .await?;
+
+        let conflicting = sqlx::query!(
+            "SELECT cid, raw_cbor FROM events WHERE author = ? AND seq = ? AND cid != ?",
+            author,
+            seq,
+            cid_str
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut forks_recorded = 0usize;
+        for row in &conflicting {
+            forks_recorded += record_fork(
+                &mut *tx,
+                &author,
+                "event",
+                seq,
+                (&cid_str, &raw_cbor),
+                (&row.cid, &row.raw_cbor),
+                now_ms(),
+            )
+            .await?;
+        }
+        if forks_recorded > 0 {
+            warn!(
+                author = %author,
+                seq,
+                cid = %cid_str,
+                "event fork (equivocation) detected: conflicting event for same seq"
+            );
+        }
 
         match &envelope.payload.kind {
             EventKind::Post { text } => {
@@ -285,7 +344,7 @@ impl Store {
         }
 
         tx.commit().await?;
-        Ok(())
+        Ok(InsertOutcome { forks_recorded })
     }
 
     pub async fn get_posts_by_author(&self, author_hex: &str) -> Result<Vec<PostRow>, StoreError> {
@@ -459,15 +518,59 @@ impl Store {
     /// validity のみ更新する republish は受理する。[networking.md] §4.2)。
     /// フォロー相手 + 自分の最新レコードの常時保持([networking.md] §3.2)の実体で、
     /// M6 の GetLatestHead 応答の源泉にもなる。
+    /// 保持中レコードが同一 sequence で異なる head CID を指す場合は fork
+    /// (equivocation)として forks へ記録する(docs/data-model.md §2.1)。
+    /// 検出は UPSERT の採否と独立に行う(stale 側が fork でも取りこぼさない)。
     pub async fn upsert_head_record(
         &self,
-        pubkey_hex: &str,
-        sequence: u64,
-        validity: i64,
-        record_bytes: &[u8],
+        record: &IpnsRecord,
         now_ms: i64,
-    ) -> Result<(), StoreError> {
-        let seq = sequence as i64;
+    ) -> Result<InsertOutcome, StoreError> {
+        let pubkey_hex = bytes_to_hex(record.payload.name.as_ref());
+        let seq = record.payload.sequence as i64;
+        let validity = record.payload.validity;
+        let record_bytes = record_to_bytes(record);
+
+        // fork 照合の読み取りと以降の書き込みをトランザクションで括らない:
+        // WAL では読み取りで始まった DEFERRED トランザクションの書き込み昇格が
+        // busy_timeout の効かない即時 SQLITE_BUSY になる。原子性は不要で
+        // (途中で落ちても fork 記録が先行するだけ)、並行 upsert で照合が
+        // すれ違っても再観測時の照合と INSERT OR IGNORE が収束させる
+        let existing = sqlx::query!(
+            "SELECT record_bytes FROM head_records WHERE pubkey = ?",
+            pubkey_hex
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        let mut forks_recorded = 0usize;
+        if let Some(row) = &existing {
+            if let Ok(known) = record_from_bytes(&row.record_bytes) {
+                if known.payload.sequence == record.payload.sequence
+                    && known.payload.value != record.payload.value
+                {
+                    let new_cid = record.payload.value.to_string();
+                    let known_cid = known.payload.value.to_string();
+                    forks_recorded = record_fork(
+                        &self.pool,
+                        &pubkey_hex,
+                        "head",
+                        seq,
+                        (&new_cid, &record_bytes),
+                        (&known_cid, &row.record_bytes),
+                        now_ms,
+                    )
+                    .await?;
+                }
+            }
+        }
+        if forks_recorded > 0 {
+            warn!(
+                author = %pubkey_hex,
+                sequence = record.payload.sequence,
+                "head record fork (equivocation) detected: conflicting head CID for same sequence"
+            );
+        }
+
         sqlx::query!(
             "INSERT INTO head_records (pubkey, sequence, validity, record_bytes, updated_at)
              VALUES (?, ?, ?, ?, ?)
@@ -487,7 +590,8 @@ impl Store {
         )
         .execute(&self.pool)
         .await?;
-        Ok(())
+
+        Ok(InsertOutcome { forks_recorded })
     }
 
     /// 保持中の最新 IPNS-headレコードを (sequence, レコードのバイト列) で返す。
@@ -618,6 +722,74 @@ impl Store {
         .await?;
         Ok(row.map(|r| r.cid))
     }
+
+    /// fork の記録を返す(新しい順)。author 指定で1アカウントに絞る。
+    pub async fn list_forks(&self, author: Option<&str>) -> Result<Vec<ForkRow>, StoreError> {
+        let rows = sqlx::query!(
+            "SELECT author, layer, seq, cid_a, cid_b, observed_at FROM forks
+             WHERE (?1 IS NULL OR author = ?1)
+             ORDER BY observed_at DESC",
+            author
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|r| ForkRow {
+            author: r.author,
+            layer: r.layer,
+            seq: r.seq as u64,
+            cid_a: r.cid_a,
+            cid_b: r.cid_b,
+            observed_at: r.observed_at,
+        })
+        .collect();
+        Ok(rows)
+    }
+
+    /// アカウントに fork の記録があるかを返す(UI の警告表示用)。
+    pub async fn has_fork(&self, pubkey_hex: &str) -> Result<bool, StoreError> {
+        let row = sqlx::query!(
+            "SELECT author FROM forks WHERE author = ? LIMIT 1",
+            pubkey_hex
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+}
+
+/// 同一 author+seq に対する矛盾ペアを forks へ記録する(証拠 bytes つき)。
+/// CID ペアは辞書順に正規化し、既知ペアの再観測は INSERT OR IGNORE で no-op。
+/// 戻り値は新規記録数(0 または 1)。
+async fn record_fork<'e, E>(
+    executor: E,
+    author: &str,
+    layer: &str,
+    seq: i64,
+    a: (&str, &[u8]),
+    b: (&str, &[u8]),
+    observed_at: i64,
+) -> Result<usize, StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let ((cid_a, evidence_a), (cid_b, evidence_b)) = if a.0 <= b.0 { (a, b) } else { (b, a) };
+    let result = sqlx::query!(
+        "INSERT OR IGNORE INTO forks
+         (author, layer, seq, cid_a, cid_b, evidence_a, evidence_b, observed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        author,
+        layer,
+        seq,
+        cid_a,
+        cid_b,
+        evidence_a,
+        evidence_b,
+        observed_at
+    )
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected() as usize)
 }
 
 /// 対象 Post の挿入時に、先に events へ到着していた同一 author の Edit/Delete を
@@ -685,7 +857,9 @@ fn kind_tag_str(kind: &EventKind) -> &'static str {
 mod tests {
     use super::*;
     use crate::event::{envelope_cid, EventKind};
+    use crate::head::create_ipns_record;
     use crate::identity::{create_envelope, Identity};
+    use crate::util::bytes_to_cid;
 
     async fn make_store() -> Store {
         Store::open_in_memory().await.unwrap()
@@ -729,10 +903,121 @@ mod tests {
             },
         );
         store.insert_event(&envelope).await.unwrap();
-        store.insert_event(&envelope).await.unwrap();
+        let outcome = store.insert_event(&envelope).await.unwrap();
 
         let posts = store.get_posts_by_author(&pubkey_hex).await.unwrap();
         assert_eq!(posts.len(), 1);
+
+        // 同一 CID の再挿入は fork ではない
+        assert_eq!(outcome.forks_recorded, 0);
+        assert!(store.list_forks(None).await.unwrap().is_empty());
+    }
+
+    /// 同一 author+seq で内容の異なる2イベント(equivocation)を挿入する。
+    /// 戻り値: (author_hex, 1本目, 2本目)
+    async fn seed_event_fork(store: &Store) -> (String, EventEnvelope, EventEnvelope) {
+        let identity = Identity::generate();
+        let author_hex = bytes_to_hex(&identity.public_key_bytes());
+        let branch_a = create_envelope(
+            &identity,
+            0,
+            None,
+            EventKind::Post {
+                text: "branch a".to_string(),
+            },
+        );
+        let branch_b = create_envelope(
+            &identity,
+            0,
+            None,
+            EventKind::Post {
+                text: "branch b".to_string(),
+            },
+        );
+        store.insert_event(&branch_a).await.unwrap();
+        store.insert_event(&branch_b).await.unwrap();
+        (author_hex, branch_a, branch_b)
+    }
+
+    #[tokio::test]
+    async fn event_fork_recorded_and_both_events_kept() {
+        let store = make_store().await;
+        let (author_hex, branch_a, branch_b) = seed_event_fork(&store).await;
+
+        // fork が1件記録され、証拠の CID ペアは辞書順に正規化されている
+        let forks = store.list_forks(None).await.unwrap();
+        assert_eq!(forks.len(), 1);
+        assert_eq!(forks[0].author, author_hex);
+        assert_eq!(forks[0].layer, "event");
+        assert_eq!(forks[0].seq, 0);
+        assert!(forks[0].cid_a < forks[0].cid_b);
+        let mut cids = [
+            envelope_cid(&branch_a).to_string(),
+            envelope_cid(&branch_b).to_string(),
+        ];
+        cids.sort();
+        assert_eq!(forks[0].cid_a, cids[0]);
+        assert_eq!(forks[0].cid_b, cids[1]);
+
+        // 検出しても両イベントとも保存される(拒否しない)
+        let posts = store.get_posts_by_author(&author_hex).await.unwrap();
+        assert_eq!(posts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn event_fork_dedup_on_reobservation() {
+        let store = make_store().await;
+        let (_, _, branch_b) = seed_event_fork(&store).await;
+
+        // 同じペアの再観測(同一イベントの再受信)では行が増えない
+        let outcome = store.insert_event(&branch_b).await.unwrap();
+        assert_eq!(outcome.forks_recorded, 0);
+        assert_eq!(store.list_forks(None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn event_fork_three_way_records_all_pairs() {
+        let store = make_store().await;
+        let identity = Identity::generate();
+        for text in ["a", "b", "c"] {
+            let e = create_envelope(
+                &identity,
+                3,
+                Some(bytes_to_cid(b"prev")),
+                EventKind::Post {
+                    text: text.to_string(),
+                },
+            );
+            store.insert_event(&e).await.unwrap();
+        }
+        // 3分岐は (a,b) (a,c) (b,c) の3ペア
+        assert_eq!(store.list_forks(None).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn has_fork_and_list_forks_filter() {
+        let store = make_store().await;
+        let (forked_author, _, _) = seed_event_fork(&store).await;
+
+        let honest = Identity::generate();
+        let honest_hex = bytes_to_hex(&honest.public_key_bytes());
+        let e = create_envelope(
+            &honest,
+            0,
+            None,
+            EventKind::Post {
+                text: "honest".to_string(),
+            },
+        );
+        store.insert_event(&e).await.unwrap();
+
+        assert!(store.has_fork(&forked_author).await.unwrap());
+        assert!(!store.has_fork(&honest_hex).await.unwrap());
+        assert_eq!(
+            store.list_forks(Some(&forked_author)).await.unwrap().len(),
+            1
+        );
+        assert!(store.list_forks(Some(&honest_hex)).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -939,42 +1224,66 @@ mod tests {
     #[tokio::test]
     async fn head_record_upsert_follows_sequence_validity_order() {
         let store = make_store().await;
-        store
-            .upsert_head_record("aa", 5, 100, b"v1", 1)
-            .await
-            .unwrap();
+        let id = Identity::generate();
+        let pubkey_hex = bytes_to_hex(&id.public_key_bytes());
+        // 同一の head CID を指すレコード(seq/validity のみ変える = republish 系列)
+        let rec = |seq: u64, validity: i64| {
+            create_ipns_record(&id, seq, bytes_to_cid(b"head"), validity, None, String::new())
+        };
+
+        store.upsert_head_record(&rec(5, 100), 1).await.unwrap();
 
         // republish(同一 sequence で validity のみ新しい)は反映される
-        store
-            .upsert_head_record("aa", 5, 200, b"v2", 2)
-            .await
-            .unwrap();
-        let (seq, bytes) = store.get_head_record("aa").await.unwrap().unwrap();
-        assert_eq!((seq, bytes.as_slice()), (5, b"v2".as_slice()));
+        let newer = rec(5, 200);
+        store.upsert_head_record(&newer, 2).await.unwrap();
+        let (seq, bytes) = store.get_head_record(&pubkey_hex).await.unwrap().unwrap();
+        assert_eq!((seq, bytes), (5, record_to_bytes(&newer)));
 
         // stale は無視: 同 sequence の古い/同じ validity、低い sequence
-        store
-            .upsert_head_record("aa", 5, 150, b"v3", 3)
-            .await
-            .unwrap();
-        store
-            .upsert_head_record("aa", 5, 200, b"v4", 4)
-            .await
-            .unwrap();
-        store
-            .upsert_head_record("aa", 4, 999, b"v5", 5)
-            .await
-            .unwrap();
-        let (seq, bytes) = store.get_head_record("aa").await.unwrap().unwrap();
-        assert_eq!((seq, bytes.as_slice()), (5, b"v2".as_slice()));
+        store.upsert_head_record(&rec(5, 150), 3).await.unwrap();
+        store.upsert_head_record(&rec(5, 200), 4).await.unwrap();
+        store.upsert_head_record(&rec(4, 999), 5).await.unwrap();
+        let (seq, bytes) = store.get_head_record(&pubkey_hex).await.unwrap().unwrap();
+        assert_eq!((seq, bytes), (5, record_to_bytes(&newer)));
 
         // sequence が上がれば validity に依らず反映(辞書式の主キーは sequence)
-        store
-            .upsert_head_record("aa", 6, 50, b"v6", 6)
-            .await
-            .unwrap();
-        let (seq, bytes) = store.get_head_record("aa").await.unwrap().unwrap();
-        assert_eq!((seq, bytes.as_slice()), (6, b"v6".as_slice()));
+        let advanced = rec(6, 50);
+        store.upsert_head_record(&advanced, 6).await.unwrap();
+        let (seq, bytes) = store.get_head_record(&pubkey_hex).await.unwrap().unwrap();
+        assert_eq!((seq, bytes), (6, record_to_bytes(&advanced)));
+
+        // republish 系列(同一 head CID)からは fork は記録されない
+        assert!(store.list_forks(None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn head_fork_recorded_on_upsert() {
+        let store = make_store().await;
+        let id = Identity::generate();
+        let pubkey_hex = bytes_to_hex(&id.public_key_bytes());
+        let best =
+            create_ipns_record(&id, 5, bytes_to_cid(b"head a"), 1_000, None, String::new());
+        let fork =
+            create_ipns_record(&id, 5, bytes_to_cid(b"head b"), 500, None, String::new());
+
+        store.upsert_head_record(&best, 1).await.unwrap();
+
+        // stale 側((sequence, validity) で劣る)の fork でも記録される
+        let outcome = store.upsert_head_record(&fork, 2).await.unwrap();
+        assert_eq!(outcome.forks_recorded, 1);
+        let forks = store.list_forks(Some(&pubkey_hex)).await.unwrap();
+        assert_eq!(forks.len(), 1);
+        assert_eq!(forks[0].layer, "head");
+        assert_eq!(forks[0].seq, 5);
+
+        // 保持レコードは argmax 規則どおり不変(検出と採否は独立)
+        let (seq, bytes) = store.get_head_record(&pubkey_hex).await.unwrap().unwrap();
+        assert_eq!((seq, bytes), (5, record_to_bytes(&best)));
+
+        // 同じペアの再観測では行が増えない
+        let outcome = store.upsert_head_record(&fork, 3).await.unwrap();
+        assert_eq!(outcome.forks_recorded, 0);
+        assert_eq!(store.list_forks(None).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

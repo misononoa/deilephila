@@ -3,7 +3,7 @@ use libp2p::PeerId;
 use tracing::debug;
 
 use crate::event::{verify_chain_link, verify_envelope, ChainError, EventEnvelope};
-use crate::head::{record_to_bytes, verify_ipns_record, IpnsRecord};
+use crate::head::{verify_ipns_record, IpnsRecord};
 use crate::network::NetworkHandle;
 use crate::store::{Store, StoreError, SyncStateRow};
 use crate::util::{bytes_to_hex, now_ms};
@@ -134,15 +134,7 @@ pub(crate) async fn handle_head_record_with_limits(
     let author_hex = bytes_to_hex(record.payload.name.as_ref());
     let head_cid_str = record.payload.value.to_string();
 
-    store
-        .upsert_head_record(
-            &author_hex,
-            record.payload.sequence,
-            record.payload.validity,
-            &record_to_bytes(record),
-            now_ms(),
-        )
-        .await?;
+    store.upsert_head_record(record, now_ms()).await?;
     if !record.payload.display_name.is_empty() {
         store
             .fill_display_name_snapshot(&author_hex, &record.payload.display_name)

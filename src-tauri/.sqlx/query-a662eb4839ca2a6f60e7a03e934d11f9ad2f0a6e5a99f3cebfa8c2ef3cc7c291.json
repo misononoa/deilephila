@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT record_bytes FROM head_records WHERE pubkey = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "record_bytes",
+        "ordinal": 0,
+        "type_info": "Blob"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a662eb4839ca2a6f60e7a03e934d11f9ad2f0a6e5a99f3cebfa8c2ef3cc7c291"
+}

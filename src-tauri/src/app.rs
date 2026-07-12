@@ -14,7 +14,7 @@ use serde::Serialize;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::event::{envelope_cid, EventKind};
-use crate::head::{create_ipns_record, record_to_bytes, IpnsRecord, RECORD_LIFETIME_MS};
+use crate::head::{create_ipns_record, IpnsRecord, RECORD_LIFETIME_MS};
 use crate::identity::{create_envelope, Identity};
 use crate::keystore::Keystore;
 use crate::network::{NetworkEvent, NetworkHandle};
@@ -117,17 +117,7 @@ async fn store_and_publish_head_record(
     network: &NetworkHandle,
     record: IpnsRecord,
 ) -> Result<(), String> {
-    let pubkey_hex = bytes_to_hex(record.payload.name.as_ref());
-    store
-        .upsert_head_record(
-            &pubkey_hex,
-            record.payload.sequence,
-            record.payload.validity,
-            &record_to_bytes(&record),
-            now_ms(),
-        )
-        .await
-        .cmd()?;
+    store.upsert_head_record(&record, now_ms()).await.cmd()?;
     network.publish_head(record).await;
     Ok(())
 }
