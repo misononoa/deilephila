@@ -723,6 +723,41 @@ impl Store {
         Ok(row.map(|r| r.cid))
     }
 
+    /// resolve / 探索応答の候補集合で観測した head レコードの fork ペアを記録する。
+    /// `upsert_head_record` の照合(保持中レコードとの比較)と異なり、候補同士の
+    /// 矛盾を記録する(保持中 best と別 sequence の fork ペアも拾える)。
+    /// ペアの妥当性検証は呼び出し側(`find_record_forks`)の責務。
+    pub async fn record_head_fork(
+        &self,
+        a: &IpnsRecord,
+        b: &IpnsRecord,
+    ) -> Result<usize, StoreError> {
+        let author = bytes_to_hex(a.payload.name.as_ref());
+        let seq = a.payload.sequence as i64;
+        let cid_a = a.payload.value.to_string();
+        let cid_b = b.payload.value.to_string();
+        let bytes_a = record_to_bytes(a);
+        let bytes_b = record_to_bytes(b);
+        let recorded = record_fork(
+            &self.pool,
+            &author,
+            "head",
+            seq,
+            (&cid_a, &bytes_a),
+            (&cid_b, &bytes_b),
+            now_ms(),
+        )
+        .await?;
+        if recorded > 0 {
+            warn!(
+                author = %author,
+                sequence = a.payload.sequence,
+                "head record fork (equivocation) detected among resolve candidates"
+            );
+        }
+        Ok(recorded)
+    }
+
     /// fork の記録を返す(新しい順)。author 指定で1アカウントに絞る。
     pub async fn list_forks(&self, author: Option<&str>) -> Result<Vec<ForkRow>, StoreError> {
         let rows = sqlx::query!(

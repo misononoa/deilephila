@@ -352,9 +352,8 @@ fn handle_kad_event(
                 .kademlia
                 .store_mut()
                 .get(&record.key)
-                .and_then(|existing| record_from_bytes(&existing.value).ok())
-                .map(|r| (r.payload.sequence, r.payload.validity));
-            match validate_inbound_head_record(&record, existing) {
+                .and_then(|existing| record_from_bytes(&existing.value).ok());
+            match validate_inbound_head_record(&record, existing.as_ref()) {
                 Ok(accepted) => {
                     if let Err(e) = swarm.behaviour_mut().kademlia.store_mut().put(accepted) {
                         warn!("head record store failed: {e:?}");

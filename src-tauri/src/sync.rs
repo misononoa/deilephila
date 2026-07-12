@@ -832,6 +832,72 @@ mod tests {
         );
     }
 
+    /// fork(equivocation)したチェーン: 同一 author の seq=1 に2ブランチが並存する。
+    /// head 層(レコードの同 sequence 異 CID)とイベント層(同 seq 異イベント)の
+    /// 両方が forks に記録され、同期自体は拒否されず継続することを検証する。
+    #[tokio::test]
+    async fn forked_chain_is_recorded_and_sync_continues() {
+        let store_a = Arc::new(Store::open_in_memory().await.unwrap());
+        let id = Identity::generate();
+        let author_hex = bytes_to_hex(&id.public_key_bytes());
+        let e0 = create_envelope(
+            &id,
+            0,
+            None,
+            EventKind::Post {
+                text: "genesis".to_string(),
+            },
+        );
+        let c0 = envelope_cid(&e0);
+        let branch_a = create_envelope(
+            &id,
+            1,
+            Some(c0.clone()),
+            EventKind::Post {
+                text: "branch a".to_string(),
+            },
+        );
+        let branch_b = create_envelope(
+            &id,
+            1,
+            Some(c0),
+            EventKind::Post {
+                text: "branch b".to_string(),
+            },
+        );
+        for e in [&e0, &branch_a, &branch_b] {
+            store_a.insert_event(e).await.unwrap();
+        }
+        let (store_b, _node_a, (handle_b, _events_b)) =
+            connect_provider_and_follower(store_a).await;
+
+        // 1本目のブランチ: 通常の同期で fork はまだ観測されない
+        let record_a = make_record_pointing(&id, 1, envelope_cid(&branch_a));
+        let o1 = handle_head_record(&store_b, &handle_b, &record_a, None)
+            .await
+            .unwrap();
+        assert_eq!(o1.new_events, 2);
+        assert!(o1.completed);
+        assert!(store_b.list_forks(None).await.unwrap().is_empty());
+
+        // 2本目のブランチ: 拒否されず取り込まれ、両層の fork が記録される
+        let record_b = make_record_pointing(&id, 1, envelope_cid(&branch_b));
+        let o2 = handle_head_record(&store_b, &handle_b, &record_b, None)
+            .await
+            .unwrap();
+        assert_eq!(o2.new_events, 1);
+        assert!(o2.completed);
+
+        let forks = store_b.list_forks(Some(&author_hex)).await.unwrap();
+        assert!(forks.iter().any(|f| f.layer == "head" && f.seq == 1));
+        assert!(forks.iter().any(|f| f.layer == "event" && f.seq == 1));
+        assert_eq!(forks.len(), 2);
+
+        // 両ブランチのイベントとも保持されている
+        let posts = store_b.get_posts_by_author(&author_hex).await.unwrap();
+        assert_eq!(posts.len(), 3);
+    }
+
     /// 予算切れは中断+再開になる(旧 TooDeep のような恒久的な同期不能を残さない)。
     #[tokio::test]
     async fn budget_halts_and_resumes() {

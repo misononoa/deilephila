@@ -14,7 +14,9 @@ use serde::Serialize;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::event::{envelope_cid, EventKind};
-use crate::head::{create_ipns_record, IpnsRecord, RECORD_LIFETIME_MS};
+use crate::head::{
+    create_ipns_record, find_record_forks, select_best, IpnsRecord, RECORD_LIFETIME_MS,
+};
 use crate::identity::{create_envelope, Identity};
 use crate::keystore::Keystore;
 use crate::network::{NetworkEvent, NetworkHandle};
@@ -298,10 +300,17 @@ pub async fn sync_follow_target(
     network: &NetworkHandle,
     pubkey: [u8; 32],
 ) -> Result<Option<SyncOutcome>, String> {
-    let Some(record) = network.resolve_ipns(pubkey).await else {
+    let candidates = network.resolve_ipns_candidates(pubkey).await;
+    // 候補集合中の fork を選択前に観測して記録する。`select_best` が選ばない側
+    // (保持中 best より古い sequence の fork ペアを含む)はこの後の同期には
+    // 現れないため、ここが唯一の観測点(docs/data-model.md §2.1)
+    for (a, b) in find_record_forks(&pubkey, &candidates) {
+        store.record_head_fork(a, b).await.cmd()?;
+    }
+    let Some(record) = select_best(&pubkey, candidates.iter()) else {
         return Ok(None);
     };
-    crate::sync::handle_head_record(store, network, &record, None)
+    crate::sync::handle_head_record(store, network, record, None)
         .await
         .map(Some)
         .cmd()

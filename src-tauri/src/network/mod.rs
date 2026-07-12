@@ -98,15 +98,26 @@ impl NetworkHandle {
             .await;
     }
 
+    /// DHT から収集した候補レコードを選択せずそのまま返す(署名検証・選択は
+    /// 呼び出し側)。argmax 選択(`select_best`)と、候補集合中の fork 観測
+    /// (`find_record_forks`)の両方の入力になる。
+    pub async fn resolve_ipns_candidates(&self, pubkey: [u8; 32]) -> Vec<IpnsRecord> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(NetworkCommand::ResolveIpns { pubkey, reply: tx })
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
     /// DHT から候補レコードを収集し、argmax統一規則(署名検証OK かつ 最大
     /// sequence)で最良のものを返す(networking.md §4)。候補なしは None。
     pub async fn resolve_ipns(&self, pubkey: [u8; 32]) -> Option<IpnsRecord> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(NetworkCommand::ResolveIpns { pubkey, reply: tx })
-            .await
-            .ok()?;
-        let candidates = rx.await.ok()?;
+        let candidates = self.resolve_ipns_candidates(pubkey).await;
         select_best(&pubkey, candidates.iter()).cloned()
     }
 
