@@ -113,6 +113,7 @@ headポインタは新規イベント(投稿・編集・削除・プロフィー
 
 - レコードはイベントと同じ canonical DAG-CBOR でシリアライズし、署名対象は payload のシリアライズ済みバイト列とする(IPNS 仕様の protobuf 形式は不採用。経緯は [mvp.md](mvp.md) §4 R1)。
 - `validity` は Unix epoch ミリ秒の絶対時刻。現在時刻が `validity` 以上なら失効(EOL)とみなす。失効済みレコードも署名と `sequence` は検証可能であり、head 解決の候補としては有効([networking.md](networking.md) §4.3)。
+- 同一 `sequence` の候補が複数あるときは `validity` が最大のものを採用する(head 解決の比較キーは (sequence, validity) の辞書式、[networking.md](networking.md) §4)。republish は `sequence` を変えず validity のみ更新した再発行であるため。
 - `display_name` は未設定のとき空文字列とする(SQLite projection と同じ規約)。
 
 ## 3. プロフィール
@@ -136,6 +137,7 @@ headポインタは新規イベント(投稿・編集・削除・プロフィー
 
 - 編集: `Edit { target: Cid, text }` イベントを追記する。`target` は対象投稿の生成イベント(`Post`)の CID。fold 時、同一 target に複数の `Edit` イベントがあれば `seq` 最大のものを採用する。
 - 削除: `Delete { target: Cid }` イベント を追記する。他ピアは `Delete` を見たら当該投稿を非表示にする。
+- `Edit` / `Delete` は `target` が同一 author の `Post` を指す場合のみ有効。fold は target の author 一致を強制し、他 author の投稿を指すイベントは無視する。イベント自体は署名・チェーン構造としては正当なので、保存(§6 `events`)とチェーン同期は妨げない(意味論の判定は fold の責務)。
 
 いずれも元のイベントブロックは不変・残存し続け、他ピアがキャッシュしていれば取得可能。編集前の本文も削除済み投稿も、原理的には取得されうる。
 

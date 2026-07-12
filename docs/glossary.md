@@ -68,7 +68,7 @@ deilephila の設計・実装で用いる用語を定義し、表記と文書の
 | IPNS名 | `name` | レコードの名前。アカウント公開鍵から導出。 | [data-model.md](data-model.md) §2.4 |
 | value | `value` | IPNS-headレコードが指す値(= `head_cid`)。 | [data-model.md](data-model.md) §2.4 |
 | validity | `validity` / EOL | レコードが失効する時刻(EOL)。失効前にオンライン中 `republish` する。 | [data-model.md](data-model.md) §2.4 |
-| argmax統一規則 | — | 候補レコード群から「署名検証OK かつ 最大 `sequence`」を選ぶ唯一の head 解決規則。 | [networking.md](networking.md) §4 |
+| argmax統一規則 | — | 候補レコード群から「署名検証OK かつ (`sequence`, `validity`) が辞書式で最大」を選ぶ唯一の head 解決規則。 | [networking.md](networking.md) §4 |
 | フォローグラフ探索 | `GetLatestHead` | gossipsub/DHT で取得不能・鮮度不審時に、フォロワー集合へ最良レコードを照会する request-response。 | [networking.md](networking.md) §4.3 |
 | ピア | peer / `PeerId` | ネットワーク上の他参加者。 | [networking.md](networking.md) §2 |
 | ノード | — | 自インスタンスの libp2p Node(常駐 async タスク)。 | [architecture.md](architecture.md) §3.4 |

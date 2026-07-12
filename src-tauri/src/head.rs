@@ -87,10 +87,12 @@ pub fn is_expired(record: &IpnsRecord, now_ms: i64) -> bool {
 }
 
 /// argmax統一規則(docs/networking.md §4): `expected_name` のアカウントに対する
-/// 候補群から「署名検証OK かつ 最大 sequence」のレコードを選ぶ。
+/// 候補群から「署名検証OK かつ (sequence, validity) が辞書式で最大」のレコードを選ぶ。
 /// gossipsub / DHT / フォローグラフ探索のどの経路で得た候補も等しくここへ合流させる。
 /// EOL 失効済みも候補として有効。name 不一致(別アカウント宛)の候補は除外する。
-/// 同 sequence の複数候補(fork の疑い)は先に現れたものを保持する。
+/// validity を副キーにするのは、republish が sequence を変えず validity のみ
+/// 更新するため(validity は署名対象なので第三者は延命を偽装できない)。
+/// 同一 (sequence, validity) の複数候補(fork の疑い)は先に現れたものを保持する。
 pub fn select_best<'a>(
     expected_name: &[u8; 32],
     candidates: impl IntoIterator<Item = &'a IpnsRecord>,
@@ -100,7 +102,12 @@ pub fn select_best<'a>(
         .filter(|r| r.payload.name.as_ref() == expected_name)
         .filter(|r| verify_ipns_record(r).is_ok())
         .fold(None::<&IpnsRecord>, |best, r| match best {
-            Some(b) if b.payload.sequence >= r.payload.sequence => Some(b),
+            Some(b)
+                if (b.payload.sequence, b.payload.validity)
+                    >= (r.payload.sequence, r.payload.validity) =>
+            {
+                Some(b)
+            }
             _ => Some(r),
         })
 }
@@ -267,8 +274,26 @@ mod tests {
     }
 
     #[test]
+    fn select_best_same_sequence_prefers_newer_validity() {
+        // republish = 同一 sequence で validity のみ更新。順序に依らず新しい方を選ぶ
+        let id = Identity::generate();
+        let original = make_record(&id, 5, 1_000);
+        let republished = make_record(&id, 5, 2_000);
+
+        let best = select_best(&id.public_key_bytes(), [&original, &republished]).unwrap();
+        assert_eq!(best.payload.validity, 2_000);
+        let best = select_best(&id.public_key_bytes(), [&republished, &original]).unwrap();
+        assert_eq!(best.payload.validity, 2_000);
+
+        // sequence は validity より優先される(辞書式)
+        let newer_seq = make_record(&id, 6, 500);
+        let best = select_best(&id.public_key_bytes(), [&republished, &newer_seq]).unwrap();
+        assert_eq!(best.payload.sequence, 6);
+    }
+
+    #[test]
     fn select_best_tie_keeps_first() {
-        // 同 sequence で異なる内容 = fork の疑い。規則としては先着を保持する
+        // 同一 (sequence, validity) で異なる内容 = fork の疑い。規則としては先着を保持する
         let id = Identity::generate();
         let a = make_record(&id, 5, 1_000);
         let b = create_ipns_record(

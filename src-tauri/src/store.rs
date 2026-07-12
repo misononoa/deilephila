@@ -132,14 +132,18 @@ impl Store {
                 .execute(&mut *tx)
                 .await?;
             }
+            // Edit/Delete は target が同一 author の Post を指す場合のみ有効
+            // (data-model.md §4)。author 条件がないと、他人の投稿 CID を target に
+            // 指す不正イベントで projection が書き換えられてしまう
             EventKind::Edit { target, text } => {
                 let target_str = target.to_string();
                 sqlx::query!(
                     "UPDATE posts SET text = ?, edited = 1, latest_edit_seq = ?
-                     WHERE cid = ? AND latest_edit_seq < ?",
+                     WHERE cid = ? AND author = ? AND latest_edit_seq < ?",
                     text,
                     seq,
                     target_str,
+                    author,
                     seq
                 )
                 .execute(&mut *tx)
@@ -147,9 +151,13 @@ impl Store {
             }
             EventKind::Delete { target } => {
                 let target_str = target.to_string();
-                sqlx::query!("UPDATE posts SET deleted = 1 WHERE cid = ?", target_str)
-                    .execute(&mut *tx)
-                    .await?;
+                sqlx::query!(
+                    "UPDATE posts SET deleted = 1 WHERE cid = ? AND author = ?",
+                    target_str,
+                    author
+                )
+                .execute(&mut *tx)
+                .await?;
             }
             EventKind::Profile {
                 display_name, bio, ..
@@ -263,6 +271,14 @@ impl Store {
         Ok(())
     }
 
+    /// 指定した公開鍵をフォローしているかを返す(受信レコードの受理判定用)。
+    pub async fn is_followed(&self, pubkey_hex: &str) -> Result<bool, StoreError> {
+        let row = sqlx::query!("SELECT pubkey FROM follows WHERE pubkey = ?", pubkey_hex)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
+    }
+
     /// フォロー一覧を返す(新しい順)。display_name は accounts にあれば同梱。
     pub async fn get_follows(&self) -> Result<Vec<FollowRow>, StoreError> {
         let rows = sqlx::query!(
@@ -334,27 +350,34 @@ impl Store {
         Ok(row.map(|r| (r.seq as u64, Some(r.cid))))
     }
 
-    /// IPNS-headレコードを保存する。既知 sequence 以下のレコードは無視する(冪等)。
+    /// IPNS-headレコードを保存する。既知レコードを (sequence, validity) の辞書式で
+    /// 上回るものだけ反映する(stale の巻き戻しを拒否しつつ、sequence を変えず
+    /// validity のみ更新する republish は受理する。[networking.md] §4.2)。
     /// フォロー相手 + 自分の最新レコードの常時保持([networking.md] §3.2)の実体で、
     /// M6 の GetLatestHead 応答の源泉にもなる。
     pub async fn upsert_head_record(
         &self,
         pubkey_hex: &str,
         sequence: u64,
+        validity: i64,
         record_bytes: &[u8],
         now_ms: i64,
     ) -> Result<(), StoreError> {
         let seq = sequence as i64;
         sqlx::query!(
-            "INSERT INTO head_records (pubkey, sequence, record_bytes, updated_at)
-             VALUES (?, ?, ?, ?)
+            "INSERT INTO head_records (pubkey, sequence, validity, record_bytes, updated_at)
+             VALUES (?, ?, ?, ?, ?)
              ON CONFLICT(pubkey) DO UPDATE SET
                  sequence = excluded.sequence,
+                 validity = excluded.validity,
                  record_bytes = excluded.record_bytes,
                  updated_at = excluded.updated_at
-             WHERE excluded.sequence > head_records.sequence",
+             WHERE excluded.sequence > head_records.sequence
+                OR (excluded.sequence = head_records.sequence
+                    AND excluded.validity > head_records.validity)",
             pubkey_hex,
             seq,
+            validity,
             record_bytes,
             now_ms
         )
@@ -545,6 +568,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cross_author_edit_is_ignored() {
+        let store = make_store().await;
+        let victim = Identity::generate();
+        let attacker = Identity::generate();
+        let victim_hex = bytes_to_hex(&victim.public_key_bytes());
+
+        let post = create_envelope(
+            &victim,
+            0,
+            None,
+            EventKind::Post {
+                text: "original".to_string(),
+            },
+        );
+        let post_cid = envelope_cid(&post);
+        store.insert_event(&post).await.unwrap();
+
+        // 攻撃者が自分のチェーンに、被害者の投稿を target に指す Edit を載せる。
+        // イベント自体は正当(署名・チェーン構造OK)なので保存はされるが、
+        // fold では無視される(data-model.md §4)
+        let forged_edit = create_envelope(
+            &attacker,
+            0,
+            None,
+            EventKind::Edit {
+                text: "hacked".to_string(),
+                target: post_cid,
+            },
+        );
+        store.insert_event(&forged_edit).await.unwrap();
+
+        let posts = store.get_posts_by_author(&victim_hex).await.unwrap();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].text, "original");
+        assert!(!posts[0].edited);
+    }
+
+    #[tokio::test]
+    async fn cross_author_delete_is_ignored() {
+        let store = make_store().await;
+        let victim = Identity::generate();
+        let attacker = Identity::generate();
+        let victim_hex = bytes_to_hex(&victim.public_key_bytes());
+
+        let post = create_envelope(
+            &victim,
+            0,
+            None,
+            EventKind::Post {
+                text: "keep me".to_string(),
+            },
+        );
+        let post_cid = envelope_cid(&post);
+        store.insert_event(&post).await.unwrap();
+
+        let forged_delete = create_envelope(
+            &attacker,
+            0,
+            None,
+            EventKind::Delete { target: post_cid },
+        );
+        store.insert_event(&forged_delete).await.unwrap();
+
+        let posts = store.get_posts_by_author(&victim_hex).await.unwrap();
+        assert_eq!(posts.len(), 1);
+        assert!(!posts[0].deleted);
+    }
+
+    #[tokio::test]
     async fn profile_upsert() {
         let store = make_store().await;
         let identity = Identity::generate();
@@ -611,6 +703,47 @@ mod tests {
 
         let follows = store.get_follows().await.unwrap();
         assert_eq!(follows[0].display_name.as_deref(), Some("Bob"));
+    }
+
+    #[tokio::test]
+    async fn head_record_upsert_follows_sequence_validity_order() {
+        let store = make_store().await;
+        store
+            .upsert_head_record("aa", 5, 100, b"v1", 1)
+            .await
+            .unwrap();
+
+        // republish(同一 sequence で validity のみ新しい)は反映される
+        store
+            .upsert_head_record("aa", 5, 200, b"v2", 2)
+            .await
+            .unwrap();
+        let (seq, bytes) = store.get_head_record("aa").await.unwrap().unwrap();
+        assert_eq!((seq, bytes.as_slice()), (5, b"v2".as_slice()));
+
+        // stale は無視: 同 sequence の古い/同じ validity、低い sequence
+        store
+            .upsert_head_record("aa", 5, 150, b"v3", 3)
+            .await
+            .unwrap();
+        store
+            .upsert_head_record("aa", 5, 200, b"v4", 4)
+            .await
+            .unwrap();
+        store
+            .upsert_head_record("aa", 4, 999, b"v5", 5)
+            .await
+            .unwrap();
+        let (seq, bytes) = store.get_head_record("aa").await.unwrap().unwrap();
+        assert_eq!((seq, bytes.as_slice()), (5, b"v2".as_slice()));
+
+        // sequence が上がれば validity に依らず反映(辞書式の主キーは sequence)
+        store
+            .upsert_head_record("aa", 6, 50, b"v6", 6)
+            .await
+            .unwrap();
+        let (seq, bytes) = store.get_head_record("aa").await.unwrap().unwrap();
+        assert_eq!((seq, bytes.as_slice()), (6, b"v6".as_slice()));
     }
 
     #[tokio::test]
