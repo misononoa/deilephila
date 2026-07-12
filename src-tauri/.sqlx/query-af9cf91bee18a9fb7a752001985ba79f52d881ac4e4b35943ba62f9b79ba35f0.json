@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT cid, raw_cbor FROM events WHERE author = ? AND seq = ? AND cid != ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "cid",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "raw_cbor",
+        "ordinal": 1,
+        "type_info": "Blob"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "af9cf91bee18a9fb7a752001985ba79f52d881ac4e4b35943ba62f9b79ba35f0"
+}

@@ -3,7 +3,7 @@ import { computed } from "vue";
 import type { PostData } from "../types";
 import { truncateHex } from "../utils";
 
-const props = defineProps<{ post: PostData }>();
+const props = defineProps<{ post: PostData; forked?: boolean }>();
 
 const shortAuthor = computed(() => truncateHex(props.post.author));
 const authorName = computed(() => props.post.author_display_name);
@@ -35,6 +35,13 @@ const formattedTime = computed(() => {
       </span>
       <span v-if="post.deleted" class="text-xs px-1.5 py-0.5 rounded bg-red-50 text-red-400">
         削除済み
+      </span>
+      <span
+        v-if="forked"
+        class="text-xs px-1.5 py-0.5 rounded bg-amber-50 text-amber-600"
+        title="このアカウントのチェーンに矛盾する分岐(fork)が検出されています。鍵の漏洩や不正の可能性があります"
+      >
+        ⚠ fork 検出
       </span>
     </div>
     <p class="text-sm text-gray-800 leading-relaxed whitespace-pre-wrap wrap-break-word">

@@ -60,6 +60,7 @@ deilephila の設計・実装で用いる用語を定義し、表記と文書の
 | projection | — | `fold` 結果を SQLite に投影したキャッシュ。正典ではなく再構築可能。 | [data-model.md](data-model.md) §6 |
 | 遅延適用 | — | `Post` 挿入時に、先に到着していた同一 author の `Edit`/`Delete` を projection へ再適用する規則。挿入順序に依存しない収束を保証。 | [data-model.md](data-model.md) §6 |
 | 正典 | source of truth | 最終的な真実の所在。deilephila ではチェーン(SQLiteは projection)。 | [data-model.md](data-model.md) §6 |
+| fork | equivocation / 二枚舌 | 同一 author の同一 `seq` に対して異なる CID が観測された状態。イベントチェーン層と IPNS-headレコード層の両方で起こりうる。不正または鍵漏洩の疑いであり、検出時は矛盾する両署名を証拠として `forks` テーブルへ記録し、保存・同期は継続する。 | [data-model.md](data-model.md) §2.1 |
 
 ## 4. ネットワーク
 

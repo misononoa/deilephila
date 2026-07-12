@@ -3,7 +3,7 @@ use libp2p::PeerId;
 use tracing::debug;
 
 use crate::event::{verify_chain_link, verify_envelope, ChainError, EventEnvelope};
-use crate::head::{record_to_bytes, verify_ipns_record, IpnsRecord};
+use crate::head::{verify_ipns_record, IpnsRecord};
 use crate::network::NetworkHandle;
 use crate::store::{Store, StoreError, SyncStateRow};
 use crate::util::{bytes_to_hex, now_ms};
@@ -63,6 +63,9 @@ pub struct SyncOutcome {
     /// 遡行が genesis または窓下限まで到達済みか。
     /// false = 未取得区間が残っており、次回の announce/resolve で再開される
     pub completed: bool,
+    /// この同期で新たに記録された fork の件数(head 層 + イベント層)。
+    /// 呼び出し側(app.rs)が UI への警告通知に使う
+    pub forks_detected: usize,
 }
 
 /// 遡行の停止理由。ブロック取得失敗と予算切れはエラーではなく停止として扱う
@@ -134,15 +137,10 @@ pub(crate) async fn handle_head_record_with_limits(
     let author_hex = bytes_to_hex(record.payload.name.as_ref());
     let head_cid_str = record.payload.value.to_string();
 
-    store
-        .upsert_head_record(
-            &author_hex,
-            record.payload.sequence,
-            record.payload.validity,
-            &record_to_bytes(record),
-            now_ms(),
-        )
-        .await?;
+    let mut forks_detected = store
+        .upsert_head_record(record, now_ms())
+        .await?
+        .forks_recorded;
     // sequence 比較で新旧判定するため、空文字列(未設定)への遷移も含めて常に反映する
     // (store 側の WHERE ガードが古いレコードによる巻き戻しを防ぐ。issue #8)
     store
@@ -173,6 +171,7 @@ pub(crate) async fn handle_head_record_with_limits(
             return Ok(SyncOutcome {
                 new_events: 0,
                 completed: true,
+                forks_detected,
             });
         }
     }
@@ -194,6 +193,7 @@ pub(crate) async fn handle_head_record_with_limits(
             floor,
             &mut budget,
             limits.chunk,
+            &mut forks_detected,
         )
         .await?;
         new_events += n;
@@ -222,6 +222,7 @@ pub(crate) async fn handle_head_record_with_limits(
                         floor,
                         &mut budget,
                         limits.chunk,
+                        &mut forks_detected,
                     )
                     .await?;
                     new_events += n;
@@ -270,6 +271,7 @@ pub(crate) async fn handle_head_record_with_limits(
     Ok(SyncOutcome {
         new_events,
         completed,
+        forks_detected,
     })
 }
 
@@ -287,6 +289,7 @@ async fn traverse_and_ingest(
     floor: u64,
     budget: &mut usize,
     chunk: usize,
+    forks_detected: &mut usize,
 ) -> Result<(usize, StopKind), StoreError> {
     let mut inserted = 0usize;
     let mut buffer: Vec<EventEnvelope> = Vec::new();
@@ -335,11 +338,11 @@ async fn traverse_and_ingest(
         expected_seq = expected_seq.saturating_sub(1);
         buffer.push(envelope);
         if buffer.len() >= chunk {
-            flush_chunk(store, &mut buffer, &mut inserted).await?;
+            flush_chunk(store, &mut buffer, &mut inserted, forks_detected).await?;
         }
     };
 
-    flush_chunk(store, &mut buffer, &mut inserted).await?;
+    flush_chunk(store, &mut buffer, &mut inserted, forks_detected).await?;
     Ok((inserted, stop))
 }
 
@@ -350,9 +353,10 @@ async fn flush_chunk(
     store: &Store,
     buffer: &mut Vec<EventEnvelope>,
     inserted: &mut usize,
+    forks_detected: &mut usize,
 ) -> Result<(), StoreError> {
     for envelope in buffer.iter().rev() {
-        store.insert_event(envelope).await?;
+        *forks_detected += store.insert_event(envelope).await?.forks_recorded;
     }
     *inserted += buffer.len();
     buffer.clear();
@@ -898,6 +902,74 @@ mod tests {
             store_b.get_posts_by_author(&pubkey_hex).await.unwrap().len(),
             10
         );
+    }
+
+    /// fork(equivocation)したチェーン: 同一 author の seq=1 に2ブランチが並存する。
+    /// head 層(レコードの同 sequence 異 CID)とイベント層(同 seq 異イベント)の
+    /// 両方が forks に記録され、同期自体は拒否されず継続することを検証する。
+    #[tokio::test]
+    async fn forked_chain_is_recorded_and_sync_continues() {
+        let store_a = Arc::new(Store::open_in_memory().await.unwrap());
+        let id = Identity::generate();
+        let author_hex = bytes_to_hex(&id.public_key_bytes());
+        let e0 = create_envelope(
+            &id,
+            0,
+            None,
+            EventKind::Post {
+                text: "genesis".to_string(),
+            },
+        );
+        let c0 = envelope_cid(&e0);
+        let branch_a = create_envelope(
+            &id,
+            1,
+            Some(c0.clone()),
+            EventKind::Post {
+                text: "branch a".to_string(),
+            },
+        );
+        let branch_b = create_envelope(
+            &id,
+            1,
+            Some(c0),
+            EventKind::Post {
+                text: "branch b".to_string(),
+            },
+        );
+        for e in [&e0, &branch_a, &branch_b] {
+            store_a.insert_event(e).await.unwrap();
+        }
+        let (store_b, _node_a, (handle_b, _events_b)) =
+            connect_provider_and_follower(store_a).await;
+
+        // 1本目のブランチ: 通常の同期で fork はまだ観測されない
+        let record_a = make_record_pointing(&id, 1, envelope_cid(&branch_a));
+        let o1 = handle_head_record(&store_b, &handle_b, &record_a, None)
+            .await
+            .unwrap();
+        assert_eq!(o1.new_events, 2);
+        assert!(o1.completed);
+        assert_eq!(o1.forks_detected, 0);
+        assert!(store_b.list_forks(None).await.unwrap().is_empty());
+
+        // 2本目のブランチ: 拒否されず取り込まれ、両層の fork が記録される
+        let record_b = make_record_pointing(&id, 1, envelope_cid(&branch_b));
+        let o2 = handle_head_record(&store_b, &handle_b, &record_b, None)
+            .await
+            .unwrap();
+        assert_eq!(o2.new_events, 1);
+        assert!(o2.completed);
+        assert_eq!(o2.forks_detected, 2); // head 層 1 + イベント層 1
+
+        let forks = store_b.list_forks(Some(&author_hex)).await.unwrap();
+        assert!(forks.iter().any(|f| f.layer == "head" && f.seq == 1));
+        assert!(forks.iter().any(|f| f.layer == "event" && f.seq == 1));
+        assert_eq!(forks.len(), 2);
+
+        // 両ブランチのイベントとも保持されている
+        let posts = store_b.get_posts_by_author(&author_hex).await.unwrap();
+        assert_eq!(posts.len(), 3);
     }
 
     /// 予算切れは中断+再開になる(旧 TooDeep のような恒久的な同期不能を残さない)。
