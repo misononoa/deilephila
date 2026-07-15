@@ -3,7 +3,7 @@
 //! ロジックはすべて app.rs 側にあり、この層は Tauri の型(`State`)を剥がし、
 //! `AppError` を文字列へ変換する(エラーの文字列化はこの境界に集約する)。
 
-use crate::app::{self, AppState, AppStatus, FollowView, PostView};
+use crate::app::{self, AppState, AppStatus, FollowView, ForkView, PostView};
 
 #[tauri::command]
 pub async fn get_app_status(state: tauri::State<'_, AppState>) -> Result<AppStatus, String> {
@@ -67,4 +67,9 @@ pub async fn get_follows(state: tauri::State<'_, AppState>) -> Result<Vec<Follow
 #[tauri::command]
 pub async fn get_timeline(state: tauri::State<'_, AppState>) -> Result<Vec<PostView>, String> {
     app::get_timeline(state.inner()).await.map_err(String::from)
+}
+
+#[tauri::command]
+pub async fn get_forks(state: tauri::State<'_, AppState>) -> Result<Vec<ForkView>, String> {
+    app::get_forks(state.inner()).await.map_err(String::from)
 }

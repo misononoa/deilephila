@@ -40,20 +40,39 @@ pub(crate) fn record_matches_topic(record: &IpnsRecord, topic: &gossipsub::Topic
 ///   更新する republish は受理する。networking.md §4.2)
 /// 受理時は validity から失効時刻を再計算したレコードを返す
 /// (送信者申告の expires を信用しない)。
+///
+/// 拒否した同一 sequence・異 head CID(fork の疑い)はここでは記録しない:
+/// DHT の格納義務はフォロー外アカウントにも及ぶため、記録すると使い捨て鍵で
+/// forks を膨張させる攻撃面になる。フォロー相手の fork は gossipsub / resolve /
+/// チェーン遡行の経路で検出される(docs/data-model.md §2.1)。拒否理由の文字列
+/// だけ stale と区別し、ログから観測できるようにする。
 pub(crate) fn validate_inbound_head_record(
     record: &kad::Record,
-    existing: Option<(u64, i64)>,
+    existing: Option<&IpnsRecord>,
 ) -> Result<kad::Record, String> {
     let decoded = record_from_bytes(&record.value).map_err(|e| format!("undecodable: {e}"))?;
     verify_ipns_record(&decoded).map_err(|_| "invalid signature".to_string())?;
     if record.key != head_record_key(decoded.payload.name.as_ref()) {
         return Err("key does not match record name".to_string());
     }
-    if let Some((known_seq, known_validity)) = existing {
-        if (decoded.payload.sequence, decoded.payload.validity) <= (known_seq, known_validity) {
+    if let Some(known) = existing {
+        let incoming = (decoded.payload.sequence, decoded.payload.validity);
+        let held = (known.payload.sequence, known.payload.validity);
+        if incoming <= held {
+            if decoded.payload.sequence == known.payload.sequence
+                && decoded.payload.value != known.payload.value
+            {
+                return Err(format!(
+                    "conflicting head CID for same sequence {} (possible fork)",
+                    decoded.payload.sequence
+                ));
+            }
             return Err(format!(
-                "stale record (sequence {}, validity {}) (known: sequence {known_seq}, validity {known_validity})",
-                decoded.payload.sequence, decoded.payload.validity
+                "stale record (sequence {}, validity {}) (known: sequence {}, validity {})",
+                decoded.payload.sequence,
+                decoded.payload.validity,
+                known.payload.sequence,
+                known.payload.validity
             ));
         }
     }
@@ -105,20 +124,35 @@ mod tests {
             publisher: None,
             expires: None,
         };
+        let known = |seq: u64, v: i64| make_record(&id, seq, v);
 
         // 新規(既知レコードなし)は受理され、validity 由来の失効時刻が付く
         let accepted = validate_inbound_head_record(&kad_record, None).unwrap();
         assert!(accepted.expires.is_some());
 
         // (sequence, validity) の辞書式で既知を上回れば受理、同じ・下回るは stale として拒否
-        assert!(validate_inbound_head_record(&kad_record, Some((4, validity))).is_ok());
-        assert!(validate_inbound_head_record(&kad_record, Some((5, validity))).is_err());
-        assert!(validate_inbound_head_record(&kad_record, Some((6, validity))).is_err());
+        assert!(validate_inbound_head_record(&kad_record, Some(&known(4, validity))).is_ok());
+        assert!(validate_inbound_head_record(&kad_record, Some(&known(5, validity))).is_err());
+        assert!(validate_inbound_head_record(&kad_record, Some(&known(6, validity))).is_err());
 
         // republish(同一 sequence で validity のみ新しい)は受理される。
         // validity が既知と同じ・古いものは拒否
-        assert!(validate_inbound_head_record(&kad_record, Some((5, validity - 1))).is_ok());
-        assert!(validate_inbound_head_record(&kad_record, Some((5, validity + 1))).is_err());
+        assert!(validate_inbound_head_record(&kad_record, Some(&known(5, validity - 1))).is_ok());
+        assert!(validate_inbound_head_record(&kad_record, Some(&known(5, validity + 1))).is_err());
+
+        // 同一 sequence で異なる head CID を指す既知レコードとの競合は、
+        // stale と区別した理由(fork の疑い)で拒否される
+        let conflicting = crate::head::create_ipns_record(
+            &id,
+            5,
+            crate::util::bytes_to_cid(b"other head"),
+            validity + 1,
+            None,
+            String::new(),
+        );
+        let reason =
+            validate_inbound_head_record(&kad_record, Some(&conflicting)).unwrap_err();
+        assert!(reason.contains("possible fork"), "reason: {reason}");
 
         // 改ざんレコード(署名不一致)は拒否
         let mut tampered = record.clone();

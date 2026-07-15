@@ -112,6 +112,32 @@ pub fn select_best<'a>(
         })
 }
 
+/// 候補集合から equivocation(同一 sequence で異なる head CID を指す、署名検証OKな
+/// レコードのペア)を列挙する(docs/data-model.md §2.1)。`select_best` が argmax で
+/// 1件を選ぶのと独立に、候補集合そのものに含まれる矛盾を観測するための関数で、
+/// DHT resolve と(M6 の)フォローグラフ探索の応答検証が共用する。
+/// republish(同一 sequence・同一 head CID で validity のみ異なる)は fork ではない。
+/// name 不一致・署名検証に失敗する候補は第三者が偽造できるため除外する。
+pub fn find_record_forks<'a>(
+    expected_name: &[u8; 32],
+    candidates: &'a [IpnsRecord],
+) -> Vec<(&'a IpnsRecord, &'a IpnsRecord)> {
+    let valid: Vec<&IpnsRecord> = candidates
+        .iter()
+        .filter(|r| r.payload.name.as_ref() == expected_name)
+        .filter(|r| verify_ipns_record(r).is_ok())
+        .collect();
+    let mut pairs = Vec::new();
+    for (i, a) in valid.iter().enumerate() {
+        for b in &valid[i + 1..] {
+            if a.payload.sequence == b.payload.sequence && a.payload.value != b.payload.value {
+                pairs.push((*a, *b));
+            }
+        }
+    }
+    pairs
+}
+
 // --- IPNS-headレコードのバイト列相互変換(kad::Record / gossipsub 搬送用) ---
 
 pub fn record_to_bytes(record: &IpnsRecord) -> Vec<u8> {
@@ -289,6 +315,46 @@ mod tests {
         let newer_seq = make_record(&id, 6, 500);
         let best = select_best(&id.public_key_bytes(), [&republished, &newer_seq]).unwrap();
         assert_eq!(best.payload.sequence, 6);
+    }
+
+    #[test]
+    fn find_record_forks_detects_equivocation() {
+        let id = Identity::generate();
+        let a = make_record(&id, 5, 1_000);
+        let b = create_ipns_record(
+            &id,
+            5,
+            bytes_to_cid(b"other head"),
+            2_000, // validity が違っても、同一 sequence で head CID が違えば fork
+            None,
+            String::new(),
+        );
+        let unrelated = make_record(&id, 6, 1_000);
+
+        let candidates = [a.clone(), b.clone(), unrelated];
+        let forks = find_record_forks(&id.public_key_bytes(), &candidates);
+        assert_eq!(forks.len(), 1);
+        let (x, y) = forks[0];
+        assert_eq!(x.payload.value, a.payload.value);
+        assert_eq!(y.payload.value, b.payload.value);
+    }
+
+    #[test]
+    fn find_record_forks_ignores_republish_and_invalid() {
+        let id = Identity::generate();
+        let original = make_record(&id, 5, 1_000);
+        let republished = make_record(&id, 5, 2_000); // 同一 head CID、validity のみ更新
+
+        // 署名の壊れた矛盾候補: 第三者が偽造できるため fork の証拠にならない
+        let mut forged = make_record(&id, 5, 1_000);
+        forged.payload.value = bytes_to_cid(b"forged head");
+
+        // 別アカウントの正当なレコード(name 不一致)も対象外
+        let other = Identity::generate();
+        let theirs = make_record(&other, 5, 1_000);
+
+        let candidates = [original, republished, forged, theirs];
+        assert!(find_record_forks(&id.public_key_bytes(), &candidates).is_empty());
     }
 
     #[test]

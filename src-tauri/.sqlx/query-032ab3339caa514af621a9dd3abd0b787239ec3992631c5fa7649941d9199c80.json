@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR IGNORE INTO forks\n         (author, layer, seq, cid_a, cid_b, evidence_a, evidence_b, observed_at)\n         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 8
+    },
+    "nullable": []
+  },
+  "hash": "032ab3339caa514af621a9dd3abd0b787239ec3992631c5fa7649941d9199c80"
+}

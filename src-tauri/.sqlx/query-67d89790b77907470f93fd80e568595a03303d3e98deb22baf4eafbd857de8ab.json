@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT author, layer, seq, cid_a, cid_b, observed_at FROM forks\n             WHERE (?1 IS NULL OR author = ?1)\n             ORDER BY observed_at DESC",
+  "describe": {
+    "columns": [
+      {
+        "name": "author",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "layer",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "seq",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "cid_a",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "cid_b",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "observed_at",
+        "ordinal": 5,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "67d89790b77907470f93fd80e568595a03303d3e98deb22baf4eafbd857de8ab"
+}

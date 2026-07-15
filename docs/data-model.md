@@ -35,7 +35,7 @@ struct EventPayload {
 
 - イベントを canonical DAG-CBOR でシリアライズ → ハッシュ → CID を得る。これがそのイベントの不変アドレスとなる。
 - `prev` により、ユーザーごとに1本の追記専用ログ(イベントチェーン)が形成される。
-- `seq` は欠損・分岐検出に使う。同一 seq で異なる CID が観測されたら fork = 不正/鍵漏洩の疑い。
+- `seq` は欠損・分岐検出に使う。同一 seq で異なる CID が観測されたら fork(equivocation)= 不正/鍵漏洩の疑い。検出したノードは矛盾する両イベントの署名付き bytes を証拠として `forks` テーブル(§6)へ記録し、イベントの保存とチェーン同期は継続する(整合性は個別署名で保たれるため)。UNIQUE 制約等による挿入拒否は採らない(経緯は [mvp.md](mvp.md) §4 R2)。UI にはアカウント単位の警告として露出し、検出後の対処(降格・遮断等)は [mvp.md](mvp.md) §4 R4 の論点とする。
 - 編集・削除も過去イベントを書き換えず、対象を指す新イベントとして追記する(後述 §4)。「投稿」という対象は、その生成イベント(`Post`)の CID で一意に参照される。
 
 ### 2.2 チェーン構造図
@@ -114,6 +114,7 @@ headポインタは新規イベント(投稿・編集・削除・プロフィー
 - レコードはイベントと同じ canonical DAG-CBOR でシリアライズし、署名対象は payload のシリアライズ済みバイト列とする(IPNS 仕様の protobuf 形式は不採用。経緯は [mvp.md](mvp.md) §4 R1)。
 - `validity` は Unix epoch ミリ秒の絶対時刻。現在時刻が `validity` 以上なら失効(EOL)とみなす。失効済みレコードも署名と `sequence` は検証可能であり、head 解決の候補としては有効([networking.md](networking.md) §4.3)。
 - 同一 `sequence` の候補が複数あるときは `validity` が最大のものを採用する(head 解決の比較キーは (sequence, validity) の辞書式、[networking.md](networking.md) §4)。republish は `sequence` を変えず validity のみ更新した再発行であるため。
+- 同一 `sequence` で異なる head CID を指す複数のレコードは fork(equivocation)であり、イベントチェーンの fork(§2.1)と同様に矛盾ペアを証拠つきで `forks` テーブル(§6)へ記録する(選択自体は argmax 規則のまま行う)。
 - `display_name` は未設定のとき空文字列とする(SQLite projection と同じ規約)。
 
 ## 3. プロフィール
@@ -160,6 +161,7 @@ projection は純粋な関数(`events` の fold)なので、DBが壊れても `e
 | `accounts` | プロフィール fold 結果 + head 記録 | pubkey, display_name(Tier 1。チェーンの `Profile` fold 由来), bio, latest_head_cid, last_seen, snapshot_display_name(Tier 0。IPNS-headレコード同梱値のキャッシュ), snapshot_seq(snapshot_display_name の同梱元レコードの sequence。表示解決は §3 参照) |
 | `head_records` | 最新 IPNS-headレコードの常時保持(自分 + フォロー相手。[networking.md](networking.md) §3.2) | pubkey, sequence, record_bytes(署名済みレコードの DAG-CBOR 原文), updated_at |
 | `sync_state` | author 別の遡行同期の進捗([networking.md](networking.md) §4.4) | pubkey, window_floor_seq(遡行下限。正典値), cursor_cid / cursor_seq(取得済み区間最下端。events から再導出できるキャッシュ), completed(遡行完了フラグ), updated_at |
+| `forks` | fork(equivocation)の記録(§2.1)。`events` は保持ポリシーで追い出され `head_records` は最良1件しか残らないため、矛盾する両署名を自己完結の証拠として保持する | author, layer(`event` / `head`), seq, cid_a / cid_b(辞書順に正規化。主キーの一部で、同一ペアの再観測は無視), evidence_a / evidence_b(署名済み DAG-CBOR 原文), observed_at |
 | `follows` | フォローリスト | pubkey, since |
 | `peers` | ピア情報 | peer_id, multiaddrs, last_connected |
 
