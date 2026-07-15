@@ -18,29 +18,52 @@ use crate::head::{
     create_ipns_record, find_record_forks, select_best, IpnsRecord, RECORD_LIFETIME_MS,
 };
 use crate::identity::{create_envelope, Identity};
-use crate::keystore::Keystore;
+use crate::keystore::{Keystore, KeystoreError};
 use crate::network::{NetworkEvent, NetworkHandle};
-use crate::store::{Store, TimelineRow};
-use crate::sync::SyncOutcome;
+use crate::store::{Store, StoreError, TimelineRow};
+use crate::sync::{SyncError, SyncOutcome};
 use crate::util::{bytes_to_hex, hex_to_pubkey, now_ms};
 
-// --- ヘルパー ---
+// --- エラー ---
 
-trait ToCommandResult<T> {
-    fn cmd(self) -> Result<T, String>;
+/// Application Core のエラー。各層の型付きエラー(`KeystoreError` / `StoreError` /
+/// `SyncError`)を `#[from]` で集約し、呼び出し側(commands.rs・テスト)が失敗の
+/// 種別を variant で判別できるようにする。文字列化は IPC 境界(commands.rs)での
+/// み行い、下位エラーは `transparent` で元の Display をそのまま透過する。
+#[derive(Debug, thiserror::Error)]
+pub enum AppError {
+    #[error("account not unlocked")]
+    NotUnlocked,
+    #[error("account already exists; use unlock_account")]
+    AlreadyExists,
+    /// 入力不正(公開鍵 hex の形式不正・自己フォロー等)
+    #[error("{0}")]
+    InvalidInput(String),
+    #[error(transparent)]
+    Keystore(#[from] KeystoreError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Sync(#[from] SyncError),
 }
 
-impl<T, E: ToString> ToCommandResult<T> for Result<T, E> {
-    fn cmd(self) -> Result<T, String> {
-        self.map_err(|e| e.to_string())
+/// IPC 境界(commands.rs)用の文字列化。フロントが種別分岐を必要とするように
+/// なったら serde による構造化エラー(kind + message)へ拡張する。
+impl From<AppError> for String {
+    fn from(e: AppError) -> String {
+        e.to_string()
     }
 }
 
+// --- ヘルパー ---
+
 /// 公開鍵 hex の正規化と検証(64桁の16進、小文字化)。
-fn normalize_pubkey_hex(input: &str) -> Result<String, String> {
+fn normalize_pubkey_hex(input: &str) -> Result<String, AppError> {
     let s = input.trim().to_ascii_lowercase();
     if s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err("public key must be a 64-char hex string".to_string());
+        return Err(AppError::InvalidInput(
+            "public key must be a 64-char hex string".to_string(),
+        ));
     }
     Ok(s)
 }
@@ -92,18 +115,16 @@ async fn build_head_record(
     identity: &Identity,
     sequence: u64,
     head_cid: Cid,
-) -> Result<IpnsRecord, String> {
+) -> Result<IpnsRecord, AppError> {
     let pubkey_hex = bytes_to_hex(&identity.public_key_bytes());
     let display_name = store
         .get_account(&pubkey_hex)
-        .await
-        .cmd()?
+        .await?
         .map(|a| a.display_name)
         .unwrap_or_default();
     let profile_cid = store
         .get_latest_profile_cid(&pubkey_hex)
-        .await
-        .cmd()?
+        .await?
         .and_then(|s| s.parse::<Cid>().ok());
     Ok(create_ipns_record(
         identity,
@@ -121,8 +142,8 @@ async fn store_and_publish_head_record(
     store: &Store,
     network: &NetworkHandle,
     record: IpnsRecord,
-) -> Result<(), String> {
-    store.upsert_head_record(&record, now_ms()).await.cmd()?;
+) -> Result<(), AppError> {
+    store.upsert_head_record(&record, now_ms()).await?;
     network.publish_head(record).await;
     Ok(())
 }
@@ -130,7 +151,7 @@ async fn store_and_publish_head_record(
 /// 自分の最新 head のレコードを validity を更新して再発行する。
 /// unlock 時と定期 republish タスク(`REPUBLISH_INTERVAL` 周期、lib.rs)から呼ばれる。
 /// 未アンロック・head 未作成なら何もしない。戻り値は publish したかどうか。
-pub async fn republish_head(state: &AppState) -> Result<bool, String> {
+pub async fn republish_head(state: &AppState) -> Result<bool, AppError> {
     let record = {
         let guard = state.account.lock().await;
         let Some(account) = guard.as_ref() else {
@@ -319,21 +340,19 @@ pub async fn sync_follow_target(
     store: &Store,
     network: &NetworkHandle,
     pubkey: [u8; 32],
-) -> Result<Option<SyncOutcome>, String> {
+) -> Result<Option<SyncOutcome>, AppError> {
     let candidates = network.resolve_ipns_candidates(pubkey).await;
     // 候補集合中の fork を選択前に観測して記録する。`select_best` が選ばない側
     // (保持中 best より古い sequence の fork ペアを含む)はこの後の同期には
     // 現れないため、ここが唯一の観測点(docs/data-model.md §2.1)
     let mut candidate_forks = 0usize;
     for (a, b) in find_record_forks(&pubkey, &candidates) {
-        candidate_forks += store.record_head_fork(a, b).await.cmd()?;
+        candidate_forks += store.record_head_fork(a, b).await?;
     }
     let Some(record) = select_best(&pubkey, candidates.iter()) else {
         return Ok(None);
     };
-    let mut outcome = crate::sync::handle_head_record(store, network, record, None)
-        .await
-        .cmd()?;
+    let mut outcome = crate::sync::handle_head_record(store, network, record, None).await?;
     outcome.forks_detected += candidate_forks;
     Ok(Some(outcome))
 }
@@ -385,18 +404,18 @@ fn spawn_sync_follow_target(
 /// アプリの状態を返す。
 /// setup: Keystore ファイルが存在するか
 /// unlocked: アカウントがメモリ上にロードされているか
-pub async fn get_app_status(state: &AppState) -> Result<AppStatus, String> {
+pub async fn get_app_status(state: &AppState) -> Result<AppStatus, AppError> {
     let setup = Keystore::exists(&state.app_dir);
     let unlocked = state.account.lock().await.is_some();
     Ok(AppStatus { setup, unlocked })
 }
 
 /// 初回セットアップ: 新しいアカウントを生成し Keystore を作成する。成功時は pubkey hex を返す。
-pub async fn setup_account(state: &AppState, passphrase: String) -> Result<String, String> {
+pub async fn setup_account(state: &AppState, passphrase: String) -> Result<String, AppError> {
     if Keystore::exists(&state.app_dir) {
-        return Err("account already exists; use unlock_account".to_string());
+        return Err(AppError::AlreadyExists);
     }
-    let (ks, pubkey) = Keystore::create(&passphrase, &state.app_dir).cmd()?;
+    let (ks, pubkey) = Keystore::create(&passphrase, &state.app_dir)?;
     let pubkey_hex = bytes_to_hex(&pubkey);
     let identity = ks.into_identity();
     *state.account.lock().await = Some(ActiveAccount {
@@ -408,16 +427,15 @@ pub async fn setup_account(state: &AppState, passphrase: String) -> Result<Strin
 }
 
 /// 既存アカウントを passphrase で復号してアンロックする。成功時は pubkey hex を返す。
-pub async fn unlock_account(state: &AppState, passphrase: String) -> Result<String, String> {
-    let ks = Keystore::load(&passphrase, &state.app_dir).cmd()?;
+pub async fn unlock_account(state: &AppState, passphrase: String) -> Result<String, AppError> {
+    let ks = Keystore::load(&passphrase, &state.app_dir)?;
     let pubkey_hex = bytes_to_hex(&ks.identity().public_key_bytes());
 
     // SQLite の events テーブルから最大 seq を取得して head を復元する
     let (next_seq, head_cid) = state
         .store
         .get_head(&pubkey_hex)
-        .await
-        .cmd()?
+        .await?
         .map(|(max_seq, cid_str)| {
             let cid = cid_str.and_then(|s| s.parse::<Cid>().ok());
             (max_seq + 1, cid)
@@ -433,7 +451,7 @@ pub async fn unlock_account(state: &AppState, passphrase: String) -> Result<Stri
 
     // フォロー全件の feed トピック購読を復元し、オフライン中の取りこぼしを
     // DHT から回収する(gossipsub は過去分を再送しないため resolve が唯一の回収経路)
-    for follow in state.store.get_follows().await.cmd()? {
+    for follow in state.store.get_follows().await? {
         state.network.subscribe(follow.pubkey.clone()).await;
         spawn_sync_follow_target(
             Arc::clone(&state.store),
@@ -450,9 +468,9 @@ pub async fn unlock_account(state: &AppState, passphrase: String) -> Result<Stri
 }
 
 /// テキスト投稿を作成・署名し SQLite に保存する。成功時はイベント CID を返す。
-pub async fn create_post(state: &AppState, text: String) -> Result<String, String> {
+pub async fn create_post(state: &AppState, text: String) -> Result<String, AppError> {
     let mut guard = state.account.lock().await;
-    let account = guard.as_mut().ok_or("account not unlocked")?;
+    let account = guard.as_mut().ok_or(AppError::NotUnlocked)?;
 
     let seq = account.next_seq;
     let prev = account.head_cid.clone();
@@ -460,7 +478,7 @@ pub async fn create_post(state: &AppState, text: String) -> Result<String, Strin
     let cid = envelope_cid(&envelope);
     let cid_str = cid.to_string();
 
-    state.store.insert_event(&envelope).await.cmd()?;
+    state.store.insert_event(&envelope).await?;
 
     state
         .store
@@ -468,8 +486,7 @@ pub async fn create_post(state: &AppState, text: String) -> Result<String, Strin
             &bytes_to_hex(&account.identity.public_key_bytes()),
             &cid_str,
         )
-        .await
-        .cmd()?;
+        .await?;
 
     account.next_seq = seq + 1;
     account.head_cid = Some(cid.clone());
@@ -484,19 +501,19 @@ pub async fn create_post(state: &AppState, text: String) -> Result<String, Strin
 
 /// 公開鍵(hex)でフォローする。follows へ追加し、feed トピックを購読し、
 /// 相手の最新 IPNS-headレコードを DHT から解決してチェーンを取り込む。
-pub async fn follow_user(state: &AppState, pubkey: String) -> Result<(), String> {
+pub async fn follow_user(state: &AppState, pubkey: String) -> Result<(), AppError> {
     let pubkey_hex = normalize_pubkey_hex(&pubkey)?;
 
     let self_hex = {
         let guard = state.account.lock().await;
-        let account = guard.as_ref().ok_or("account not unlocked")?;
+        let account = guard.as_ref().ok_or(AppError::NotUnlocked)?;
         bytes_to_hex(&account.identity.public_key_bytes())
     };
     if pubkey_hex == self_hex {
-        return Err("cannot follow yourself".to_string());
+        return Err(AppError::InvalidInput("cannot follow yourself".to_string()));
     }
 
-    state.store.add_follow(&pubkey_hex, now_ms()).await.cmd()?;
+    state.store.add_follow(&pubkey_hex, now_ms()).await?;
     state.network.subscribe(pubkey_hex.clone()).await;
 
     // 後発フォロワーの初回同期(networking.md §4.2): gossipsub の次の publish を
@@ -512,16 +529,16 @@ pub async fn follow_user(state: &AppState, pubkey: String) -> Result<(), String>
 }
 
 /// フォローを解除する。follows から削除し、feed トピックの購読を止める。
-pub async fn unfollow_user(state: &AppState, pubkey: String) -> Result<(), String> {
+pub async fn unfollow_user(state: &AppState, pubkey: String) -> Result<(), AppError> {
     let pubkey_hex = normalize_pubkey_hex(&pubkey)?;
-    state.store.remove_follow(&pubkey_hex).await.cmd()?;
+    state.store.remove_follow(&pubkey_hex).await?;
     state.network.unsubscribe(pubkey_hex).await;
     Ok(())
 }
 
 /// フォロー一覧を返す(表示名は accounts に fold 済みなら同梱)。
-pub async fn get_follows(state: &AppState) -> Result<Vec<FollowView>, String> {
-    let follows = state.store.get_follows().await.cmd()?;
+pub async fn get_follows(state: &AppState) -> Result<Vec<FollowView>, AppError> {
+    let follows = state.store.get_follows().await?;
     Ok(follows
         .into_iter()
         .map(|f| FollowView {
@@ -534,20 +551,20 @@ pub async fn get_follows(state: &AppState) -> Result<Vec<FollowView>, String> {
 
 /// タイムライン(自分 + フォロー相手の投稿、時系列降順)を返す。
 /// 削除済みを含む(UI 側でフィルタ)。
-pub async fn get_timeline(state: &AppState) -> Result<Vec<PostView>, String> {
+pub async fn get_timeline(state: &AppState) -> Result<Vec<PostView>, AppError> {
     let pubkey_hex = {
         let guard = state.account.lock().await;
-        let account = guard.as_ref().ok_or("account not unlocked")?;
+        let account = guard.as_ref().ok_or(AppError::NotUnlocked)?;
         bytes_to_hex(&account.identity.public_key_bytes())
     };
 
-    let rows = state.store.get_timeline(&pubkey_hex).await.cmd()?;
+    let rows = state.store.get_timeline(&pubkey_hex).await?;
     Ok(rows.into_iter().map(PostView::from).collect())
 }
 
 /// fork(equivocation)の記録を返す(UI の警告表示用。data-model.md §2.1)。
-pub async fn get_forks(state: &AppState) -> Result<Vec<ForkView>, String> {
-    let rows = state.store.list_forks(None).await.cmd()?;
+pub async fn get_forks(state: &AppState) -> Result<Vec<ForkView>, AppError> {
+    let rows = state.store.list_forks(None).await?;
     Ok(rows
         .into_iter()
         .map(|f| ForkView {
